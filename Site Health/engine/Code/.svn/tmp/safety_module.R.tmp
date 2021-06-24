@@ -1,0 +1,113 @@
+# --------------
+# Title: safety_module.R
+# --------------
+# Author: Bambo Sosina (bsosina@deloitte.com),
+#         Kevin Coltin (kcoltin@deloitte.com)
+# Date: Oct 27 2016
+# --------------
+# Description: This file contains code for running the Safety module.
+# --------------
+# Author:
+# Date:
+# Modification:
+# --------------
+
+write_log_sub_header("safety_module.R", "Safety Module", log_con)
+
+# Applies the models for adverse events (AEs), severe adverse events (SAEs), and
+# the combined safety score.
+#
+# Args:
+#   Model.data: Dataframe with one row for each site to be evaluated, and
+#     containing all variables necessary to apply the safety module
+#
+# Returns: Dataframe of Safety module results, formatted for output to the
+#  relevant Oracle database table which feeds into Spotfire.
+run_safety_model <- function(Model.data) {
+  # Start to create the Safety output dataset
+  SA.out <- Model.data[c("HM_SITE_ID", "HM_STUDY_ID")]
+  SA.out$HM_WRK_SAFETY_OUT_ID <- NA # Add empty key column for sqlSave function
+  SA.out$SAFETY_PATIENT_COUNT <- Model.data$NUM_SUBJECTS
+  SA.out$SAFETY_PATIENT_COUNT_SCALE <- Model.data$NUM_SUBJECTS_SCALED
+  SA.out$SAFETY_PERIOD_START <- Model.data$SITE_FSFV_DATE_DERIVED
+  SA.out$SAFETY_PERIOD_LENGTH <- as.integer(Model.data$DATE -
+                                            Model.data$SITE_FSFV_DATE_DERIVED+1)
+  SA.out$OS_ISSUE_COUNT_EXPECTED <- NA # field is no longer used by the models
+#######################################################################
+#############New Change Here###############################################
+#######################################################################
+#  SA.out$AE_COUNT <- Model.data$NUM_AES_REPORTED_PREV_12MON
+#  SA.out$SAE_COUNT <- Model.data$NUM_SAES_REPORTED_PREV_12MON
+SA.out$SAE_COUNT=Model.data$NUM_SAES_REPORTED;
+SA.out$AE_COUNT=Model.data$NUM_AES_REPORTED;
+#######################################################################
+#######################################################################
+
+  # Update model dataset to exclude rows that can't be modeled, for example
+  # because they contain new factor levels not present in the training dataset
+  covars <- readRDS(file.path(MODEL.DIR, "sa_module_covariates.rds"))
+  Train.data <- readRDS(file.path(MODEL.DIR, "sa_module_train_dataset.rds"))
+  Model.data <- data.frame(model.frame(covars, Model.data))
+  
+  Model.data <- trim_fun(old.data=Train.data, new.data=Model.data, log_con)$trim.data
+  # Subset output table rows to only rows we can obtain safety percentiles for
+  SA.out <- SA.out[SA.out$HM_SITE_ID %in% Model.data$HM_SITE_ID,]
+
+
+  # Load fitted AE model object
+  ae.model <- readRDS(file.path(MODEL.DIR, "ae_fitted_model.rds"))
+  # Use model to score sites
+  cat("Scoring sites with predicted AE count model...\n", file=log_con)
+  predicted <- try(predict(ae.model, Model.data, type="response"), silent=TRUE)
+  if (inherits(predicted, "try-error")) {
+    stop("ERROR when scoring AE model:", as.character(predicted))
+  }
+  cat(paste("AE model successfully scored", sum(!is.na(predicted)), "out of",
+            nrow(Model.data), "sites\n"), file=log_con)
+  SA.out$AE_COUNT_EXPECTED <- predicted
+
+
+  # Then, repeat to load and score SAE model
+  sae.model <- readRDS(file.path(MODEL.DIR, "sae_fitted_model.rds"))
+  cat("Scoring sites with predicted SAE count model...\n", file=log_con)
+  predicted <- try(predict(sae.model, Model.data, type="response"), silent=TRUE)
+  if (inherits(predicted, "try-error")) {
+    stop("ERROR when scoring SAE model:", as.character(predicted))
+  }
+  cat(paste("SAE model successfully scored", sum(!is.na(predicted)), "out of",
+            nrow(Model.data), "sites\n"), file=log_con)
+  SA.out$SAE_COUNT_EXPECTED <- predicted
+
+  # Create percentiles based on the p-value of the differences between observed
+  # and expected AE and SAE counts, using the Poisson distribution
+  # Higher values of AE and SAE Percentile mean higher values of Actual minus
+  # Expected, i.e. higher (more positively unexpected) adverse event counts
+  cat("Creating combined AE+SAE percentile score for Safety module...\n",
+      file=log_con)
+  SA.out$AE_PERCENTILE <- ppois(SA.out$AE_COUNT,
+                                lambda=SA.out$AE_COUNT_EXPECTED)
+  SA.out$SAE_PERCENTILE <- ppois(SA.out$SAE_COUNT,
+                                 lambda=SA.out$SAE_COUNT_EXPECTED)
+  
+  # Weight the combined percentile score based on the respective counts of AEs
+  # and SAEs
+  AE.weight <- 1. / sum(SA.out$AE_COUNT)
+  SAE.weight <- 1. / sum(SA.out$SAE_COUNT)
+  SA.out$SAFETY_PERCENTILE <- (AE.weight * SA.out$AE_PERCENTILE +
+                               SAE.weight * SA.out$SAE_PERCENTILE) /
+                                (AE.weight + SAE.weight)
+
+
+
+  return(SA.out[c("HM_WRK_SAFETY_OUT_ID", "HM_SITE_ID", "HM_STUDY_ID",
+                  "SAFETY_PATIENT_COUNT", "SAFETY_PATIENT_COUNT_SCALE",
+                  "SAFETY_PERIOD_START", "SAFETY_PERIOD_LENGTH",
+                  "OS_ISSUE_COUNT_EXPECTED", "SAFETY_PERCENTILE",
+                  "SAE_PERCENTILE", "AE_PERCENTILE", "AE_COUNT",
+                  "AE_COUNT_EXPECTED", "SAE_COUNT", "SAE_COUNT_EXPECTED")])
+}
+
+sa.out <- run_safety_model(Model.data.SA)
+
+
+

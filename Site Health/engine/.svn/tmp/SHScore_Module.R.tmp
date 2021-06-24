@@ -1,0 +1,234 @@
+####################################################################################################
+# THIS PROGRAM APPLIES OVERALL SITE HEALTH REGRESSION MODEL COEFFICIENTS TO VISUALIZED SITES
+# AND PRODUCES OUTPUTS FOR USE IN VISUALIZATION 	
+#
+# File Version: 1.1
+# Last Modified: 2014-JUN-16					         
+####################################################################################################
+
+rm(list=ls())
+wrkDir <- Sys.getenv("R_TMP")
+setwd(wrkDir) 
+
+
+########## Input Files ##############
+# 
+# 1. PD_Model.Rdata
+# 2. SAE_Model.Rdata
+# 3. RT_Model.Rdata
+# 4. TL_Model.RData
+# 5. Abs_SHScore_Model.Rdata
+#
+######################################
+source("/app/r/engine/SiteHealthLogger.R")
+
+logInfo("Reading in model data from all modules for the SH Score...")
+
+logInfo("Reading in model data from all modules for the SH Score...")
+
+############ Load RData ################
+load(file=paste(Sys.getenv("R_DATA"),"Absolute_Site_Health_Model.Rdata", sep="/"))
+load(file=paste(Sys.getenv("R_DATA"),"Absolute_Site_Health_Model_2.Rdata", sep="/"))
+load(file="TL_Model.Rdata")
+load(file="SAFETY_Model.Rdata")
+load(file="PD_Model.Rdata")
+load(file="RT_Model.Rdata")
+
+logInfo("Done reading in model data for the SH Score...")
+
+logInfo("Done reading in model data for the SH Score...")
+
+
+##################################################################################################
+# MERGE ALL MODULE OUTPUTS TOGETHER - ONGOING STUDIES and IN-SCOPE SITES FOR VISUALIZATION
+##################################################################################################
+
+# Merge PD module outputs
+	PD_MODEL_VARIABLES <-alg_pd_ongoing_last[,c("HM_STUDY_ID","HM_SITE_ID","PERIOD_END","PD_COUNT_NEXT","PD_COUNT_NEXT_lag1", "PD_COUNT_NEXT_lag2", "PD_COUNT_NEXT_lag3",
+									"fit_pd","fit_pd_lag1", "fit_pd_lag2", "fit_pd_lag3",
+									"fit_pd_resid_percentile","fit_pd_resid_percentile_lag1")]
+
+# Merge SAFETY module outputs
+	SAFETY_MODEL_VARIABLES <-dataComb5[,c("HM_STUDY_ID","HM_SITE_ID","aecount","pred_ae","sae_delta","saecount","SAE_DELAYS_COUNT","COUNTRY_NAME","DEVELOPMENT_PHASE","STUDY_THERAPEUTIC_AREA")]
+
+	MASTER_MODULE_DATA <- merge(PD_MODEL_VARIABLES, SAFETY_MODEL_VARIABLES, by=c("HM_STUDY_ID","HM_SITE_ID"),all=T)
+
+# Merge Staffing Dynamics module outputs
+	#### NEW JUNE 13 2014 - added period length from the staffing dynamics module as it is now used in the absolute site health model
+	ongoing_turnover$PERIOD_LENGTH=as.numeric(ongoing_turnover$PERIOD_LENGTH)
+	TURNOVER_MODEL_VARIABLES <-ongoing_turnover[,c("HM_STUDY_ID","HM_SITE_ID","PERIOD_LENGTH","SI_COUNT_1yr.Scaled.CAPPED","SI_TURN_1yr_p",
+									"MON_TURN_1yr_p","MON_COUNT_1yr.Scaled.CAPPED","Turn.prediction2.P.active")]
+	
+	MASTER_MODULE_DATA <- merge(MASTER_MODULE_DATA, TURNOVER_MODEL_VARIABLES, by=c("HM_STUDY_ID","HM_SITE_ID"),all=T)
+
+# Merge Timeliness module outputs
+	TIMELINESS_MODEL_VARIABLES <-ongoing_entry[,c("HM_STUDY_ID","HM_SITE_ID","VISIT_CMPLY_PERCENTAGE_1","VISIT_CMPLY_PERCENTAGE_2","fitted.P","COMPL.3.MONTH","PT.VISIT.COUNT.3.MONTH")]
+
+	MASTER_MODULE_DATA <- merge(MASTER_MODULE_DATA, TIMELINESS_MODEL_VARIABLES, by=c("HM_STUDY_ID","HM_SITE_ID"),all=T)
+
+	dim(MASTER_MODULE_DATA) # 6668
+
+# Create PD and SAE Delta Fields that are used in the regression model 
+	MASTER_MODULE_DATA$PD.DELTA=MASTER_MODULE_DATA$PD_COUNT_NEXT-MASTER_MODULE_DATA$fit_pd
+	quantile(MASTER_MODULE_DATA$PD.DELTA, probs=seq(0,1,.005), na.rm=T) # -3.6 is 0.5% and 12.2 is 99.5%
+
+	MASTER_MODULE_DATA$PD.DELTA_lag1=MASTER_MODULE_DATA$PD_COUNT_NEXT_lag1-MASTER_MODULE_DATA$fit_pd_lag1
+	quantile(MASTER_MODULE_DATA$PD.DELTA_lag1, probs=seq(0,1,.025), na.rm=T) 
+
+	MASTER_MODULE_DATA$PD.DELTA_lag2=MASTER_MODULE_DATA$PD_COUNT_NEXT_lag2-MASTER_MODULE_DATA$fit_pd_lag2
+	quantile(MASTER_MODULE_DATA$PD.DELTA_lag2, probs=seq(0,1,.025), na.rm=T) 
+
+	MASTER_MODULE_DATA$PD.DELTA_lag3=MASTER_MODULE_DATA$PD_COUNT_NEXT_lag3-MASTER_MODULE_DATA$fit_pd_lag3
+	quantile(MASTER_MODULE_DATA$PD.DELTA_lag3, probs=seq(0,1,.025), na.rm=T) 
+
+	#MASTER_MODULE_DATA$SAE.DELTA=MASTER_MODULE_DATA$AE_COUNT_SERIOUS-MASTER_MODULE_DATA$fit.sae5
+	quantile(MASTER_MODULE_DATA$sae_delta,probs=seq(0,1,.005), na.rm=T) #-1.4 is 2.5% and 3.18 is 97.5%
+
+# Cap PD and SAE Delta Values (values close to 0.5% and 99.5% for delta values)
+
+	#### NEW JUNE 13 2014 - Change PD and SAE Delta Cap Values
+	upper.PD=11
+	lower.PD=-4.9
+	upper.SAE=3
+	lower.SAE=-3
+
+	MASTER_MODULE_DATA$PD.DELTA.CAP=ifelse(MASTER_MODULE_DATA$PD.DELTA<lower.PD,lower.PD, ifelse(MASTER_MODULE_DATA$PD.DELTA>upper.PD,upper.PD,MASTER_MODULE_DATA$PD.DELTA))
+	summary(MASTER_MODULE_DATA$PD.DELTA.CAP)
+
+	MASTER_MODULE_DATA$PD.DELTA.CAP_lag1=ifelse(MASTER_MODULE_DATA$PD.DELTA_lag1<lower.PD,lower.PD, ifelse(MASTER_MODULE_DATA$PD.DELTA_lag1>upper.PD,upper.PD,MASTER_MODULE_DATA$PD.DELTA_lag1))
+	summary(MASTER_MODULE_DATA$PD.DELTA.CAP_lag1)
+
+	MASTER_MODULE_DATA$PD.DELTA.CAP_lag2=ifelse(MASTER_MODULE_DATA$PD.DELTA_lag2<lower.PD,lower.PD, ifelse(MASTER_MODULE_DATA$PD.DELTA_lag2>upper.PD,upper.PD,MASTER_MODULE_DATA$PD.DELTA_lag2))
+	summary(MASTER_MODULE_DATA$PD.DELTA.CAP_lag2)
+
+	MASTER_MODULE_DATA$PD.DELTA.CAP_lag3=ifelse(MASTER_MODULE_DATA$PD.DELTA_lag3<lower.PD,lower.PD, ifelse(MASTER_MODULE_DATA$PD.DELTA_lag3>upper.PD,upper.PD,MASTER_MODULE_DATA$PD.DELTA_lag3))
+	summary(MASTER_MODULE_DATA$PD.DELTA.CAP_lag3)
+
+	#MASTER_MODULE_DATA$SAE.DELTA.CAP=ifelse(MASTER_MODULE_DATA$SAE.DELTA>upper.SAE,upper.SAE,ifelse(MASTER_MODULE_DATA$SAE.DELTA<lower.SAE,lower.SAE,MASTER_MODULE_DATA$SAE.DELTA))
+	#summary(MASTER_MODULE_DATA$SAE.DELTA.CAP)
+
+
+# Use percentiles values below to inform the imputed values for sites; this should not change over time
+
+	quantile(MASTER_MODULE_DATA$SI_COUNT_1yr.Scaled.CAPPED,probs=seq(0,1,.025), na.rm=T) 
+	quantile(MASTER_MODULE_DATA$MON_COUNT_1yr.Scaled.CAPPED,probs=seq(0,1,.025), na.rm=T) 
+	quantile(MASTER_MODULE_DATA$SI_TURN_1yr_p,probs=seq(0,1,.025), na.rm=T) 
+	quantile(MASTER_MODULE_DATA$MON_TURN_1yr_p,probs=seq(0,1,.025), na.rm=T) 
+	quantile(MASTER_MODULE_DATA$COMPL.3.MONTH,probs=seq(0,1,.025), na.rm=T) 
+	quantile(MASTER_MODULE_DATA$PT.VISIT.COUNT.3.MONTH,probs=seq(0,1,.025), na.rm=T) 
+
+############################################################################################
+# APPLY MODEL COEFFICIENTS TO CALCULATE OVERALL SITE HEALTH SCORE FOR ALL VISUALIZED SITES
+# IMPUTE MISSING PERCENTILE/MODULE OUTPUT DATA USED IN FINAL SITE HEALTH SCORE CALCULATION  
+############################################################################################
+
+	MASTER_MODULE_DATA$PD.DELTA.CAP <- ifelse(is.na(MASTER_MODULE_DATA$PD.DELTA.CAP),1,MASTER_MODULE_DATA$PD.DELTA.CAP)
+	MASTER_MODULE_DATA$PD.DELTA.CAP_lag1 <- ifelse(is.na(MASTER_MODULE_DATA$PD.DELTA.CAP_lag1),1,MASTER_MODULE_DATA$PD.DELTA.CAP_lag1)
+	MASTER_MODULE_DATA$PD.DELTA.CAP_lag2 <- ifelse(is.na(MASTER_MODULE_DATA$PD.DELTA.CAP_lag2),1,MASTER_MODULE_DATA$PD.DELTA.CAP_lag2)
+	MASTER_MODULE_DATA$PD.DELTA.CAP_lag3 <- ifelse(is.na(MASTER_MODULE_DATA$PD.DELTA.CAP_lag3),1,MASTER_MODULE_DATA$PD.DELTA.CAP_lag3)
+
+	MASTER_MODULE_DATA$sae_delta <- ifelse(is.na(MASTER_MODULE_DATA$sae_delta),.40,MASTER_MODULE_DATA$sae_delta)#.40 denotes the 85th percentile
+  MASTER_MODULE_DATA$saecount <- ifelse(is.na(MASTER_MODULE_DATA$saecount),0,MASTER_MODULE_DATA$saecount)#.40 denotes the 85th percentile
+  MASTER_MODULE_DATA$aecount <- ifelse(is.na(MASTER_MODULE_DATA$aecount),0,MASTER_MODULE_DATA$aecount)#.40 denotes the 85th percentile
+  MASTER_MODULE_DATA$SAE_DELAYS_COUNT <- ifelse(is.na(MASTER_MODULE_DATA$SAE_DELAYS_COUNT),0,MASTER_MODULE_DATA$SAE_DELAYS_COUNT)#.40 denotes the 85th percentile
+  
+	
+  MASTER_MODULE_DATA$SI_COUNT_1yr.Scaled.CAPPED <- ifelse(is.na(MASTER_MODULE_DATA$SI_COUNT_1yr.Scaled.CAPPED),.92,MASTER_MODULE_DATA$SI_COUNT_1yr.Scaled.CAPPED)# .92 denotes the 50th percentile
+	MASTER_MODULE_DATA$MON_COUNT_1yr.Scaled.CAPPED <- ifelse(is.na(MASTER_MODULE_DATA$MON_COUNT_1yr.Scaled.CAPPED),.67,MASTER_MODULE_DATA$MON_COUNT_1yr.Scaled.CAPPED)# .67 denotes the 50th percentile
+
+	MASTER_MODULE_DATA$SI_TURN_1yr_p <- ifelse(is.na(MASTER_MODULE_DATA$SI_TURN_1yr_p),.25,MASTER_MODULE_DATA$SI_TURN_1yr_p) #.25 denotes the 85th percentile as 50th percentile would be 0
+	MASTER_MODULE_DATA$MON_TURN_1yr_p <- ifelse(is.na(MASTER_MODULE_DATA$MON_TURN_1yr_p),.5,MASTER_MODULE_DATA$MON_TURN_1yr_p)#.5 denotes the 50th percentile
+
+	MASTER_MODULE_DATA$COMPL.3.MONTH <- ifelse(is.na(MASTER_MODULE_DATA$COMPL.3.MONTH),.54,MASTER_MODULE_DATA$COMPL.3.MONTH) #.54 denotes the 50th percentile
+	MASTER_MODULE_DATA$PT.VISIT.COUNT.3.MONTH <- ifelse(is.na(MASTER_MODULE_DATA$PT.VISIT.COUNT.3.MONTH),7,MASTER_MODULE_DATA$PT.VISIT.COUNT.3.MONTH)#7 denotes the 50th percentile
+
+	#### NEW JUNE 13 2014 - Impute missing period length outputs for sites to be a year (365 days)
+	MASTER_MODULE_DATA$PERIOD_LENGTH <- ifelse(is.na(MASTER_MODULE_DATA$PERIOD_LENGTH),365,MASTER_MODULE_DATA$PERIOD_LENGTH)
+
+
+#### NEW JUNE 13 2014 - Create a Dummy Report Type Variable (should be the same for all sites) 
+	MASTER_MODULE_DATA$REPORT_TYPESA="PSQRV"
+
+# APPLY OVERALL SITE HEALTH MODEL COEFFICIENTS TO MASTER DATA
+	#### NEW JUNE 13 2014 - rename model output data
+	Absolute_Site_Health_Model <- sh.fitF
+  Absolute_Site_Health_Model_2 <- sh.fitF2
+  analysis_dataset5<-model.frame(Absolute_Site_Health_Model)
+
+names(MASTER_MODULE_DATA)[names(MASTER_MODULE_DATA) == 'PERIOD_LENGTH'] <- 'PERIOD_LENGTH.x'
+
+id <- which(!(MASTER_MODULE_DATA$COUNTRY_NAME %in% unique(analysis_dataset5$COUNTRY_NAME)))
+MASTER_MODULE_DATA$COUNTRY_NAME[id] <- NA
+class(MASTER_MODULE_DATA$COUNTRY_NAME)
+
+id2 <- which(!(MASTER_MODULE_DATA$STUDY_THERAPEUTIC_AREA %in% unique(analysis_dataset5$STUDY_THERAPEUTIC_AREA)))
+MASTER_MODULE_DATA$STUDY_THERAPEUTIC_AREA[id2] <- NA
+class(MASTER_MODULE_DATA$STUDY_THERAPEUTIC_AREA)
+
+id4 <- which(!(MASTER_MODULE_DATA$DEVELOPMENT_PHASE %in% unique(analysis_dataset5$DEVELOPMENT_PHASE)))
+MASTER_MODULE_DATA$DEVELOPMENT_PHASE[id4] <- NA
+class(MASTER_MODULE_DATA$DEVELOPMENT_PHASE)
+
+MASTER_MODULE_DATA$PERIOD_LENGTH.x=as.difftime(MASTER_MODULE_DATA$PERIOD_LENGTH.x,units="days")
+
+
+MASTER_MODULE_DATA$OVERALL.SITE.HEALTH=predict(Absolute_Site_Health_Model,MASTER_MODULE_DATA)
+	summary(MASTER_MODULE_DATA$OVERALL.SITE.HEALTH) # scores currently range from .31 to 15.55
+
+MASTER_MODULE_DATA$OVERALL.SITE.HEALTH<-ifelse(is.na(MASTER_MODULE_DATA$OVERALL.SITE.HEALTH),predict(Absolute_Site_Health_Model_2,newdata=MASTER_MODULE_DATA),MASTER_MODULE_DATA$OVERALL.SITE.HEALTH)
+
+MASTER_MODULE_DATA$OVERALL.SITE.HEALTH<-ifelse(MASTER_MODULE_DATA$OVERALL.SITE.HEALTH<0,0,MASTER_MODULE_DATA$OVERALL.SITE.HEALTH)
+
+	worst.case= data.frame(PD.DELTA.CAP=11,PD.DELTA.CAP_lag1=11,PD.DELTA.CAP_lag2=11,PD.DELTA.CAP_lag3=11,sae_delta=30,saecount=35,aecount=300,SAE_DELAYS_COUNT=25,COUNTRY_NAME='IRELAND',STUDY_THERAPEUTIC_AREA='Pain',DEVELOPMENT_PHASE='Phase IV',
+			SI_COUNT_1yr.Scaled.CAPPED=max(MASTER_MODULE_DATA$SI_COUNT_1yr.Scaled.CAPPED, na.rm=T),MON_COUNT_1yr.Scaled.CAPPED=4, 
+			SI_TURN_1yr_p=1, MON_TURN_1yr_p=1,COMPL.3.MONTH=0,PERIOD_LENGTH.x=90,
+			PT.VISIT.COUNT.3.MONTH=max(MASTER_MODULE_DATA$PT.VISIT.COUNT.3.MONTH, na.rm=T),REPORT_TYPESA="PSQRV")
+
+	worst.case$PERIOD_LENGTH.x=as.difftime(worst.case$PERIOD_LENGTH.x,units="days")
+  worst_score <- predict(sh.fitF,worst.case)
+ 
+	best.case= data.frame(PD.DELTA.CAP=0,PD.DELTA.CAP_lag1=0,PD.DELTA.CAP_lag2=0,PD.DELTA.CAP_lag3=0,SI_COUNT_1yr.Scaled.CAPPED=6,sae_delta=0,saecount=0,aecount=0,SAE_DELAYS_COUNT=0,COUNTRY_NAME='SERBIA',STUDY_THERAPEUTIC_AREA='GENITOURINARY (UROLOGY)',DEVELOPMENT_PHASE='Phase I',
+	
+  MON_COUNT_1yr.Scaled.CAPPED=0, SI_TURN_1yr_p=0, MON_TURN_1yr_p=0,COMPL.3.MONTH=1,PT.VISIT.COUNT.3.MONTH=200,PERIOD_LENGTH.x=90,REPORT_TYPESA="PSQRV")
+  
+  best.case$PERIOD_LENGTH.x=as.difftime(best.case$PERIOD_LENGTH.x,units="days")
+
+	best_score <- (predict(Absolute_Site_Health_Model,best.case)) # Best case is 1.12 (adjusted to zero in absolute health score)
+  best_score<-ifelse(best_score<0,0,best_score)
+
+summary(MASTER_MODULE_DATA$OVERALL.SITE.HEALTH)
+	
+MASTER_MODULE_DATA$ABSOLUTE_SITE_HEALTH_SCORE = (worst_score- ifelse(MASTER_MODULE_DATA$OVERALL.SITE.HEALTH< 0,0,MASTER_MODULE_DATA$OVERALL.SITE.HEALTH))/(worst_score/10)
+	MASTER_MODULE_DATA$ABSOLUTE_SITE_HEALTH_SCORE <- ifelse(MASTER_MODULE_DATA$ABSOLUTE_SITE_HEALTH_SCORE< 0,0,MASTER_MODULE_DATA$ABSOLUTE_SITE_HEALTH_SCORE)
+	MASTER_MODULE_DATA$ABSOLUTE_SITE_HEALTH_SCORE <- ifelse(MASTER_MODULE_DATA$ABSOLUTE_SITE_HEALTH_SCORE> 10,10,MASTER_MODULE_DATA$ABSOLUTE_SITE_HEALTH_SCORE)
+	
+	summary(MASTER_MODULE_DATA$ABSOLUTE_SITE_HEALTH_SCORE) # Score should range from 0 to 10
+
+	# Produce site health indicator
+	MASTER_MODULE_DATA$SITE_HEALTH_INDICATOR <- ifelse(MASTER_MODULE_DATA$ABSOLUTE_SITE_HEALTH_SCORE < 5, 0, 1)
+
+# Produce option B site health indicator
+	MASTER_MODULE_DATA$SITE_HEALTH_INDICATOR_B <- ifelse((MASTER_MODULE_DATA$sae_delta> 2.3 & !is.na(MASTER_MODULE_DATA$sae_delta))  | 
+			(MASTER_MODULE_DATA$PD.DELTA > 7.0 & !is.na(MASTER_MODULE_DATA$PD.DELTA)) |
+ 			(MASTER_MODULE_DATA$PD.DELTA_lag1 > 7.0 & !is.na(MASTER_MODULE_DATA$PD.DELTA_lag1))|
+			(MASTER_MODULE_DATA$PD.DELTA < -2.5 & !is.na(MASTER_MODULE_DATA$PD.DELTA)) |
+ 			(MASTER_MODULE_DATA$PD.DELTA_lag1 < -2.5 & !is.na(MASTER_MODULE_DATA$PD.DELTA_lag1))|
+			(MASTER_MODULE_DATA$MON_TURN_1yr_p > .80 & !is.na(MASTER_MODULE_DATA$MON_TURN_1yr_p)) | 
+			(MASTER_MODULE_DATA$SI_TURN_1yr_p > .67 & !is.na(MASTER_MODULE_DATA$SI_TURN_1yr_p) ),0,1)
+
+	# Add the PK column for RODBC/sqlSave function
+	MASTER_MODULE_DATA$HM_WRK_GL_OUT_OVERVIEW_ID <- NA
+	
+	# Adjust for Output to the Data Mart
+	GL_OUT_OVERVIEW <- MASTER_MODULE_DATA[,c("HM_WRK_GL_OUT_OVERVIEW_ID","HM_SITE_ID","HM_STUDY_ID","ABSOLUTE_SITE_HEALTH_SCORE","SITE_HEALTH_INDICATOR","SITE_HEALTH_INDICATOR_B")]
+	
+	logInfo("Saving SHScore Model results to WRK_GL_OUT_OVERVIEW...")	
+	
+	              # Insert into WRK_GL_OUT_OVERVIEW using RODBCDataInsert function
+	               source("/app/r/engine/RODBCDataInsert.R")
+	               insertGLOut(GL_OUT_OVERVIEW)
+	               # write.csv(file="WRK_GL_OUT_OVERVIEW.csv", x=GL_OUT_OVERVIEW)
+	               logInfo("Completed saving SHScore Model results to WRK_GL_OUT_OVERVIEW...")
+	               logInfo("<DONE> - Exiting SHScore module...")
+	               
+	               

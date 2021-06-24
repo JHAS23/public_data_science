@@ -1,0 +1,61 @@
+##############################################################################################
+# RODBCInsert.R - Writes to Site Health OUT tables in WRK Schema 
+#
+# File Version: 1.1 
+# Last Modified: 2015-AUG-10 
+# Last Modified by: Brett Favro
+# 
+##############################################################################################
+
+library(RODBC)
+wrkDir <- Sys.getenv("R_TMP")
+setwd(wrkDir)
+
+insertOracleData <- function(data, tableName) {
+	tnsName <- readLines("../database.name", encoding="UTF-8")
+	channel <- odbcConnect(tnsName)	
+	# fast=FALSE will write row by row; fast=TRUE will write single INSERT
+	sqlSave(channel, data, tablename = tableName, append=TRUE, rownames=FALSE, colnames=FALSE, fast=FALSE, verbose=TRUE)
+	close(channel)
+}
+
+insertPDOut <- function(data) {
+	insertOracleData(data, "HM_DM_WRK_OWNER.WRK_PD_OUT")
+}
+
+insertPDOutHist <- function(data) {
+	insertOracleData(data, "HM_DM_WRK_OWNER.WRK_PD_OUT_HIST")
+}
+
+insertSAEOut <- function(data) {
+	insertOracleData(data, "HM_DM_WRK_OWNER.WRK_SAE_OUT")
+}
+
+insertSafetyOut <- function(data) {
+	insertOracleData(data, "HM_DM_WRK_OWNER.WRK_SAFETY_OUT")
+}
+
+insertRTOut <- function(data) {
+	insertOracleData(data, "HM_DM_WRK_OWNER.WRK_RT_OUT")
+}
+
+insertRTOutHist <- function(data) {
+	insertOracleData(data, "HM_DM_WRK_OWNER.WRK_RT_OUT_HIST")
+}
+
+insertTLOut <- function(data) {
+	insertOracleData(data, "HM_DM_WRK_OWNER.WRK_TL_OUT")
+}
+
+insertMIOut <- function(data) {
+	insertOracleData(data, "HM_DM_WRK_OWNER.WRK_MI_OUT")
+}
+
+insertGLOut <- function(data) {
+	insertOracleData(data, "HM_DM_WRK_OWNER.WRK_GL_OUT_OVERVIEW")
+}
+
+###############
+# Unit Tests 
+# ############
+#insertMIOut() 

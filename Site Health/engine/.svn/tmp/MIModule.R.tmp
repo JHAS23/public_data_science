@@ -1,0 +1,293 @@
+####################################################################################################
+# THIS PROGRAM CREATES THE TRAINING DATSET FOR THE MONITORING MODULE AND RUNS THE RELEVANT REGRESSION MODELS
+#
+# File Version: 1.1
+# Last Modified: 2015-AUG-20	
+#  
+####################################################################################################
+rm(list=ls())
+
+
+wrkDir <- Sys.getenv("R_TMP")
+setwd(wrkDir)
+
+library(plyr)
+library(MASS)
+library(data.table)
+
+source("/app/r/engine/RODBCDataFetch.R")
+source("/app/r/engine/SiteHealthLogger.R")
+
+
+logInfo("Reading in Data from the Data Mart WRK Area Views...")
+
+###### AR : READ IN INPUT FILES####################################
+
+mon_data2  <- getMIStudyData()
+mon_data  <- getMISiteData()
+subject_file <- getMISubjectData()
+mon_data3 <- getMIMonitoringData()
+or_file <- getMIOSData()
+or_questions<- getMIOSQuestionData()
+issue_res <- getMIOSIssueData()
+
+
+
+logInfo("Completed")
+
+summary(or_file$REPORT_MONITORING_ORG)
+
+logInfo("Defining MI outcome variable...")
+
+hist(mon_data2$MAX_MVI)
+mon_data2$MAX_MVI<-ifelse(mon_data2$MAX_MVI>365,365,mon_data2$MAX_MVI)
+mon_data2$MAX_MVI<-ifelse(is.na(mon_data2$MAX_MVI),112,mon_data2$MAX_MVI)
+
+or_questions$cra_awareness<-ifelse(or_questions$CRA_DOCUMENT_ISSUE=="Yes"& or_questions$CRA_MANAGING_ISSUE=="Yes",1,NA)
+or_questions$cra_awareness<-ifelse(or_questions$CRA_DOCUMENT_ISSUE=="No"|or_questions$CRA_MANAGING_ISSUE=="No",0,or_questions$cra_awareness)
+
+or_q_summary<-ddply(or_questions,.(OVERSIGHT_REPORT_ID),summarise,num_aware=sum(cra_awareness==1,na.rm=T),num_unaware=sum(cra_awareness==0,na.rm=T),awarenm=sum(CRA_DOCUMENT_ISSUE=="Yes"& CRA_MANAGING_ISSUE=="No",na.rm=T),notawarenm=sum(CRA_DOCUMENT_ISSUE=="No"& (CRA_MANAGING_ISSUE=="No"|CRA_MANAGING_ISSUE=="N/A"|is.na(CRA_MANAGING_ISSUE) ==T)))
+or_q_summary$aware_perc<-or_q_summary$num_aware/(or_q_summary$num_aware+or_q_summary$num_unaware)
+hist(or_q_summary$aware_perc)
+or_q_summary<-na.omit(or_q_summary)
+names(or_q_summary)[names(or_q_summary) == 'OVERSIGHT_REPORT_ID'] <- 'REPORT_ID'
+names(issue_res)[names(issue_res) == 'OVERSIGHT_REPORT_ID'] <- 'REPORT_ID'
+
+logInfo("Merging data to create Analysis dataset for model training...")
+
+#or_file<-readRDS("C:/DSHTEST2/HM_DM_WRK_OWNER.V_W_MI_IN_OVERSIGHT_REPORTS.RDATA")
+
+analysis_dataset3<-or_file[or_file$REPORT_SOURCE=="SH",]
+monitoring_org<-unique(analysis_dataset3[,c(2,5,8)])
+org_summary<-unique(ddply(monitoring_org,.(HM_SITE_ID),summarise,REPORT_START_DATE=max(REPORT_START_DATE)))
+monitoring_org2<-merge(org_summary,monitoring_org,by=c('HM_SITE_ID','REPORT_START_DATE'),all.x=T)
+
+monitoring_org2<-monitoring_org2[monitoring_org2$REPORT_MONITORING_ORG!="N/A",]
+
+
+analysis_dataset3<-unique(merge(analysis_dataset3[,c(1,2,3,4,6,7,8,9)],monitoring_org2[,c(1,3)],by='HM_SITE_ID'))
+
+
+
+
+analysis_dataset4<-merge(analysis_dataset3,or_q_summary,by="REPORT_ID",)
+analysis_dataset4$REPORT_START_DATE<-as.Date(analysis_dataset4$REPORT_START_DATE)
+
+issue_res<-merge(issue_res,analysis_dataset3[,c(1,5)],by="REPORT_ID",all.x=T)
+#issue_res<-readRDS("C:/DSHTEST2/HM_DM_WRK_OWNER.V_W_MI_IN_OR_ISSUES.RDATA")
+issue_res$OVERSIGHT_ISSUE_TARG_RESOL_DT<-as.Date(issue_res$OVERSIGHT_ISSUE_TARG_RESOL_DT)
+issue_res$ACTUAL_RESOLUTION_DT<-as.Date(issue_res$ACTUAL_RESOLUTION_DT)
+
+#####COUNT DELAYED ISSUE RESOLUTION
+issue_res$delaylength<-as.numeric(issue_res$OVERSIGHT_ISSUE_TARG_RESOL_DT-issue_res$ACTUAL_RESOLUTION_DT)
+mean(issue_res$delaylength,na.rm=T)
+issue_res$delayed<-ifelse(issue_res$delaylength<0,1,0)
+table(issue_res$delayed)
+
+for(i in 1:nrow(analysis_dataset4)){
+  date<-analysis_dataset4$REPORT_START_DATE[i]
+  analysis_dataset4$isdel[i]<-sum(issue_res$HM_SITE_ID==analysis_dataset4$HM_SITE_ID[i]& date- issue_res$OVERSIGHT_ISSUE_TARG_RESOL_DT >= 0 & date- issue_res$OVERSIGHT_ISSUE_TARG_RESOL_DT <=365 & issue_res$delayed==1 ,na.rm=T)
+}
+
+logInfo("Completed")
+
+
+##########Create new column with prev. visit date#####
+
+mon_data3$VISIT_START_DATE<-as.Date(mon_data3$VISIT_START_DATE)
+mon_data3<-mon_data3[order(mon_data3$HM_SITE_ID,mon_data3$VISIT_START_DATE),]
+mon_data3<-as.data.table(mon_data3)
+mon_data4<-mon_data3[, PREV_VISIT:=c(NA, VISIT_START_DATE[-.N]),by=HM_SITE_ID]
+mon_data4$PREV_VISIT<-as.Date(mon_data4$PREV_VISIT,origin='1970-01-01')
+
+mon_data4<-as.data.frame(mon_data4)
+mon_data3<-as.data.frame(mon_data3)
+
+mon_data4<-merge(mon_data4,mon_data2[,c(3,4)],by.x="PROTOCOL_NUMBER",by.y="PFIZER_PROTOCOL_ID",all.x=T)
+
+######Determine whether visit was outside max window or not#############
+mon_data4$OOW<-ifelse(mon_data4$VISIT_START_DATE-mon_data4$PREV_VISIT>mon_data4$MAX_MVI,1,0)
+mon_data4$OOW<-ifelse(is.na(mon_data4$OOW),0,mon_data4$OOW)
+###################################################################################################
+
+logInfo("Calculating no. of monitoring visits")
+
+###MONITORING VISIT LOOP###
+analysis_dataset4$numvisits<-NA
+for(i in 1:nrow(analysis_dataset4)){
+  date<-analysis_dataset4$REPORT_START_DATE[i]
+  analysis_dataset4$numvisits[i]<-sum(mon_data4$HM_SITE_ID==analysis_dataset4$HM_SITE_ID[i]& date- mon_data4$VISIT_START_DATE >= 0 & date- mon_data4$VISIT_START_DATE<=365,na.rm=T)
+}
+
+logInfo("Calculating no. of monitoring visits outside max. visit interval range")
+
+###VISIT LOOP OOW###
+analysis_dataset4$numvisitsoow<-NA
+for(i in 1:nrow(analysis_dataset4)){
+  date<-analysis_dataset4$REPORT_START_DATE[i]
+  analysis_dataset4$numvisitsoow[i]<-sum(mon_data4$HM_SITE_ID==analysis_dataset4$HM_SITE_ID[i]& mon_data4$OOW== 1 & date- mon_data4$VISIT_START_DATE >= 0 & date- mon_data4$VISIT_START_DATE<=365,na.rm=T)
+}
+
+logInfo("Calculating no. of Subjects and Scaling")
+
+####Subject Loop####
+
+#subject_file<-readRDS("C:/DSHTEST2/HM_DM_WRK_OWNER.V_W_MI_IN_SUBJECT.RDATA")
+subject_file$SUBJ_ENROLLED_STUDY_DT_DERIVED<-as.Date(subject_file$SUBJ_ENROLLED_STUDY_DT_DERIVED)
+subject_file$SUBJ_COMPLETED_STUDY_DT<-as.Date(subject_file$SUBJ_COMPLETED_STUDY_DT)
+subject_file$SUBJ_DISCONTINUED_DT<-as.Date(subject_file$SUBJ_DISCONTINUED_DT)
+
+
+analysis_dataset4$subject_count<-NA
+analysis_dataset4$subject_count_scaled<-NA
+
+for(j in 1:nrow(analysis_dataset4)){
+  analysis_dataset4$subject_count[j]<-sum(subject_file$HM_SITE_ID==analysis_dataset4$HM_SITE_ID[j]&subject_file$SUBJ_ENROLLED_STUDY_DT_DERIVED<=analysis_dataset4$REPORT_START_DATE[j] & (is.na(subject_file$SUBJ_COMPLETED_STUDY_DT)|analysis_dataset4$REPORT_START_DATE[j]-subject_file$SUBJ_COMPLETED_STUDY_DT<=365)& (is.na(subject_file$SUBJ_DISCONTINUED_DT)|analysis_dataset4$REPORT_START_DATE[j]-subject_file$SUBJ_DISCONTINUED_DT<=365),na.rm=TRUE)
+  analysis_dataset4$subject_count_scaled[j]<-sum(pmin((analysis_dataset4$REPORT_START_DATE[j]-subject_file$SUBJ_ENROLLED_STUDY_DT_DERIVED)/365,1)*(subject_file$HM_SITE_ID==analysis_dataset4$HM_SITE_ID[j]&subject_file$SUBJ_ENROLLED_STUDY_DT_DERIVED<=analysis_dataset4$REPORT_START_DATE[j] & (is.na(subject_file$SUBJ_COMPLETED_STUDY_DT)|analysis_dataset4$REPORT_START_DATE[j]-subject_file$SUBJ_COMPLETED_STUDY_DT<=365)& (is.na(subject_file$SUBJ_DISCONTINUED_DT)|analysis_dataset4$REPORT_START_DATE[j]-subject_file$SUBJ_DISCONTINUED_DT<=365)),na.rm=TRUE) # If subject has been active for 365 days or longer count as 1 else scale
+}
+
+############Merging all counted data into one dataset
+
+analysis_dataset5<-merge(analysis_dataset4,mon_data2[,c(1,5,6,7)],by="HM_STUDY_ID",all.x=T)
+analysis_dataset5<-merge(analysis_dataset5,mon_data3[,c(2,7)],by="HM_SITE_ID",all.x=T)
+analysis_dataset5<-merge(analysis_dataset5,mon_data[,c(1,9)],by="HM_SITE_ID",all.x=T)
+analysis_dataset5<-unique(analysis_dataset5)
+
+
+############Calculating visits per patient
+
+analysis_dataset5$vperp<-analysis_dataset5$numvisits/analysis_dataset5$subject_count_scaled
+
+
+analysis_dataset5$aware_perc[which(is.nan(analysis_dataset5$aware_perc))] = NA
+analysis_dataset5$aware_perc[which(analysis_dataset5$aware_perc==Inf)] = NA
+
+analysis_dataset5$vperp[which(is.nan(analysis_dataset5$vperp))] = NA
+analysis_dataset5$vperp[which(analysis_dataset5$vperp==Inf)] = NA
+analysis_dataset5<-na.omit(analysis_dataset5)
+summary(analysis_dataset5)
+
+logInfo("Fitting MI Model")
+############Fitting Model
+
+model_cra2<-lm(aware_perc~subject_count_scaled+as.numeric(isdel)+vperp+as.numeric(numvisitsoow)+REPORT_MONITORING_ORG+COUNTRY_NAME+DEVELOPMENT_PHASE+STUDY_THERAPEUTIC_AREA,data=analysis_dataset5)
+summary(model_cra2)
+model_cra<-lm(aware_perc~subject_count+isdel+vperp+numvisitsoow,data=analysis_dataset5)
+
+
+###########################################PREDICTIONS ON MONTHLY DATA###############################
+
+#########Recalculating subject and visit counts for current data
+dataStudy<-mon_data2[mon_data2$YN_EXCLUDED=='N',c(1,4,5,7,21)]
+dataSite<-mon_data[mon_data$YN_EXCLUDED=='N',c(1,2,4,5,6,7,9)]
+dataSite<-dataSite[!is.na(dataSite$SITE_FSFV_DATE_DERIVED),]
+
+dataSite$SITE_FSFV_DATE_DERIVED<-as.Date(dataSite$SITE_FSFV_DATE_DERIVED)
+dataSite$SITE_LSLV_DATE_DERIVED<-as.Date(dataSite$SITE_LSLV_DATE_DERIVED)
+
+dataComb1<-merge(dataStudy,dataSite,by='HM_STUDY_ID')
+dataComb1<-dataComb1[is.na(dataComb1$SITE_LSLV_DATE_DERIVED)|Sys.Date()-dataComb1$SITE_LSLV_DATE_DERIVED<=1095.73,]
+dataComb1<-unique(dataComb1)
+
+dataSubject<-subject_file[subject_file$SUBJ_ENROLLED_STUDY_DT_DERIVED<=Sys.Date() & (is.na(subject_file$SUBJ_COMPLETED_STUDY_DT)|Sys.Date()-subject_file$SUBJ_COMPLETED_STUDY_DT<=365)& (is.na(subject_file$SUBJ_DISCONTINUED_DT)|Sys.Date()-subject_file$SUBJ_DISCONTINUED_DT<=365),]
+dataSubject$scale_factor<-(Sys.Date()-dataSubject$SUBJ_ENROLLED_STUDY_DT_DERIVED)/365
+dataSubject$scale_factor<-ifelse(dataSubject$scale_factor>=1,1,dataSubject$scale_factor)
+dataSubject<-unique(dataSubject)
+dataSubject<-dataSubject[!(is.na(dataSubject$HM_SITE_ID)|is.na(dataSubject$SUBJ_STATUS_DERIVED)|dataSubject$SUBJ_STATUS_DERIVED=='SCREEN FAIL'),]
+outputSubject<-ddply(dataSubject,.(HM_SITE_ID),summarise,subject_count=length(HM_SITE_ID),subject_count_scaled=sum(scale_factor*1))
+length(outputSubject[outputSubject$subject_count!=outputSubject$subject_count_scaled,])
+
+dataVisit<-mon_data4[Sys.Date()-mon_data4$VISIT_START_DATE <=365,]
+outputVisit<-ddply(dataVisit,.(HM_SITE_ID),summarise,numvisits=sum(length(HM_SITE_ID),na.rm=T),numvisitsoow=sum(OOW,na.rm=T))
+
+dataIssue<-issue_res[Sys.Date()-issue_res$OVERSIGHT_ISSUE_TARG_RESOL_DT<=365,]
+outputIssue<-ddply(dataIssue,.(HM_SITE_ID),summarise,isdel=sum(delayed,na.rm=T),by_dead=sum(ACTUAL_RESOLUTION_DT<OVERSIGHT_ISSUE_TARG_RESOL_DT,na.rm=T))
+
+
+dataComb2<-merge(dataComb1,outputVisit,by='HM_SITE_ID',all.x=T)
+dataComb3<-merge(dataComb2,outputIssue,by='HM_SITE_ID',all.x=T)
+dataComb4<-merge(dataComb3,outputSubject,by='HM_SITE_ID',all.x=T)
+dataComb4$study_duration<-as.numeric(Sys.Date() - dataComb4$SITE_FSFV_DATE_DERIVED)
+dataComb4<-dataComb4[!is.na(dataComb4$subject_count),]
+summary(dataComb4)
+
+dataComb4$numvisits<-ifelse(is.na(dataComb4$numvisits),0,dataComb4$numvisits)
+dataComb4$isdel<-ifelse(is.na(dataComb4$isdel),0,dataComb4$isdel)
+dataComb4$numvisitsoow<-ifelse(is.na(dataComb4$numvisitsoow),0,dataComb4$numvisitsoow)
+
+dataComb4<-dataComb4[dataComb4$subject_count_scaled!=0,]
+dataComb4$vperp<-dataComb4$numvisits/dataComb4$subject_count_scaled
+dataComb5<-merge(dataComb4,mon_data3[,c(2,7)],by="HM_SITE_ID",all.x=T)
+dataComb5<-merge(dataComb5[,c(1:19)],monitoring_org2[,c(1,3)],by="HM_SITE_ID",all.x=T)
+dataComb5<-unique(dataComb5)###
+
+
+
+##################Accounting for new factor levels in new data
+id <- which(!(dataComb5$COUNTRY_NAME %in% unique(analysis_dataset5$COUNTRY_NAME)))
+dataComb5$COUNTRY_NAME[id] <- NA
+class(dataComb5$COUNTRY_NAME)
+
+id2 <- which(!(dataComb5$STUDY_THERAPEUTIC_AREA %in% unique(analysis_dataset5$STUDY_THERAPEUTIC_AREA)))
+dataComb5$STUDY_THERAPEUTIC_AREA[id2] <- NA
+class(dataComb5$STUDY_THERAPEUTIC_AREA)
+
+id3 <- which(!(dataComb5$REPORT_MONITORING_ORG %in% unique(analysis_dataset5$REPORT_MONITORING_ORG)))
+dataComb5$REPORT_MONITORING_ORG[id3] <- NA
+class(dataComb5$REPORT_MONITORING_ORG)
+
+id4 <- which(!(dataComb5$DEVELOPMENT_PHASE %in% unique(analysis_dataset5$DEVELOPMENT_PHASE)))
+dataComb5$DEVELOPMENT_PHASE[id4] <- NA
+class(dataComb5$DEVELOPMENT_PHASE)
+
+
+logInfo("Making Predictions...")
+
+###################Predicting outcome in current run's data###########
+dataComb5$CRA_pred<-predict(model_cra2,newdata=dataComb5)
+
+dataComb5$CRA_pred<-ifelse(is.na(dataComb5$CRA_pred),predict(model_cra,newdata=dataComb5),dataComb5$CRA_pred)
+dataComb5$CRA_pred<-ifelse(dataComb5$CRA_pred>1,1,dataComb5$CRA_pred)
+dataComb5$CRA_pred<-ifelse(dataComb5$CRA_pred<0,0,dataComb5$CRA_pred)
+
+dataComb5$CRA_Perc <- (rank(dataComb5$CRA_pred)/length(dataComb5$CRA_pred))
+
+dataComb5$MI_PERIOD_START<-as.Date(Sys.Date()-365)
+dataComb5$MI_PERIOD_START[dataComb5$SITE_FSFV_DATE_DERIVED>=Sys.Date()-365]<-dataComb5$SITE_FSFV_DATE_DERIVED[dataComb5$SITE_FSFV_DATE_DERIVED>=Sys.Date()-365]
+
+dataComb5$MI_PERIOD_LENGTH<-Sys.Date()-dataComb5$MI_PERIOD_START
+dataComb5$MI_PERIOD_LENGTH <- as.numeric(dataComb5$MI_PERIOD_LENGTH, units="days")
+
+
+analysis_dataset4$unaware_percent<-analysis_dataset4$notawarenm/(analysis_dataset4$notawarenm+analysis_dataset4$awarenm+analysis_dataset4$num_aware)
+analysis_dataset4$awarenot_percent<-analysis_dataset4$awarenm/(analysis_dataset4$notawarenm+analysis_dataset4$awarenm+analysis_dataset4$num_aware)
+
+
+analysis_dataset4_sum<-unique(ddply(analysis_dataset4,.(HM_SITE_ID),summarise,REPORT_START_DATE=max(REPORT_START_DATE)))
+analysis_dataset4_sum2<-unique(merge(analysis_dataset4_sum,analysis_dataset4,by=c('HM_SITE_ID','REPORT_START_DATE'),all.x=T))
+
+
+dataComb6<-merge(dataComb5,analysis_dataset4_sum2[,c(1,14,20,21)],by="HM_SITE_ID",all.x=T)
+dataComb6<-unique(dataComb6)
+                 
+
+
+logInfo("Preparing data for output")
+# Adjust and Rename Variables for Output to the Data Mart
+                 
+MI_OUT<-dataComb6[dataComb6$YN_VISUALIZE=='Y',]
+MI_OUT$HM_WRK_MI_OUT_ID <- NA
+
+
+MI_OUT<-MI_OUT[,c("HM_WRK_MI_OUT_ID", "HM_SITE_ID", "HM_STUDY_ID","subject_count", "subject_count_scaled", "MI_PERIOD_START","MI_PERIOD_LENGTH",
+                  "CRA_Perc", "aware_perc", "awarenot_percent", "unaware_percent","vperp", "numvisitsoow", "by_dead","isdel")]
+
+names(MI_OUT)<- c("HM_WRK_MI_OUT_ID", "HM_SITE_ID", "HM_STUDY_ID","MONITORING_PATIENT_COUNT", "MONITORING_PATIENT_COUNT_SCALE", "ANALYSIS_PERIOD_START","ANALYSIS_PERIOD_LENGTH","MONITORING_PERCENTILE", "AWARE_HANDLING_PERCENTILE", "AWARE_PERCENTILE","UNAWARE_PERCENTILE" ,"MV_PER_PATIENT", "MV_OUTSIDE_INTERVAL", "OR_ISS_RESOLVED_BY_DEADLINE","OR_ISS_RESOLVED_AFTER_DEADLINE"                      )
+
+# Insert into WRK_PD_OUT using RODBCDataInsert function
+source("/app/r/engine/RODBCDataInsert.R")
+insertMIOut(MI_OUT)
+
+logInfo("Completed saving MI Model results to WRK_MI_OUT...")
+logInfo("<DONE> - Exiting MI Module...")
+

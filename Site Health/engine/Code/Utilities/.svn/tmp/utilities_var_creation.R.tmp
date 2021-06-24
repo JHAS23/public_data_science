@@ -1,0 +1,864 @@
+# --------------
+# Title: utilities_var_creation.R
+# --------------
+# Author: Kevin Coltin (kcoltin@deloitte.com)
+# Date: Nov 22 2016
+# --------------
+# Description: This script contains functions for creating synthetic variables
+# used by the models in the five different modules.
+# --------------
+# Author:
+# Date:
+# Modification:
+# --------------
+
+
+# Create variable: PREV_REPORT_START_DATE = the start date of the most recent
+# report prior to the current date for a given site/study, if any
+# (value will be "N/A" if this is the first report or there were no reports
+# prior to this date)
+create_prev_report_start_date <- function(Data) {
+  print("create_prev_report_start_date");
+  f <- function(site.id, site.date) {
+    ix <- INPUT$Oversight.reports$HM_SITE_ID == site.id &
+            (!is.na(INPUT$Oversight.reports$REPORT_START_DATE)
+             & INPUT$Oversight.reports$REPORT_START_DATE < site.date)
+    if (any(ix)) {
+      return(max(INPUT$Oversight.reports[ix,"REPORT_START_DATE"]))
+    }
+    else {
+      return(as.Date(NA))
+    }
+  }
+
+  Data$PREV_REPORT_START_DATE <- mapply(f, Data$HM_SITE_ID, Data$DATE)
+  Data$PREV_REPORT_START_DATE <- as.Date(Data$PREV_REPORT_START_DATE,
+                                         R.DATE.ORIGIN)
+  return(Data)
+}
+
+
+# Create variables for number of patients and related stuff
+create_patient_vars <- function(Data, module) {
+
+  print(paste("Function - create_patient_vars-",module,sep=""));
+  # Create dataset with one row per site+date by each subject at that site
+  Subject.site.date <- merge(Data[c("HM_SITE_ID", "DATE")], INPUT$Subjects,
+                             by="HM_SITE_ID")
+  # Filter out subjects who do not have a confirmed status date at any time
+  # prior to the given date
+  Subject.site.date$MIN_DATE <- pmin(
+                               Subject.site.date$SUBJ_ENROLLED_STUDY_DT_DERIVED,
+                               Subject.site.date$SUBJ_DISCONTINUED_DT,
+                               Subject.site.date$SUBJ_COMPLETED_STUDY_DT,
+                               na.rm=TRUE)
+  Subject.site.date <- Subject.site.date[!is.na(Subject.site.date$MIN_DATE)
+                                         & Subject.site.date$MIN_DATE
+                                           <= Subject.site.date$DATE,]
+  # Latest date the subject was active - either when they dropped out, or the
+  # current date if the subject is still active
+  # Note- this *is* supposed to use pmin(), not pmax() - we want the earliest
+  # date when the subject became inactive.
+  Subject.site.date$MAX_DATE <- pmin(Subject.site.date$SUBJ_DISCONTINUED_DT,
+                                     Subject.site.date$SUBJ_COMPLETED_STUDY_DT,
+                                     Subject.site.date$DATE,
+                                     na.rm=TRUE)
+  # Number of months (defined as 30-day periods) the subject was active
+  Subject.site.date$MONTHS_ACTIVE <- as.numeric(Subject.site.date$MAX_DATE
+                                              - Subject.site.date$MIN_DATE) / 30
+
+  # Create NUM_SUBJECTS
+  Subj.count <- aggregate(Subject.site.date$SUBJ_STATUS_DERIVED,
+                          by=Subject.site.date[c("HM_SITE_ID", "DATE")],
+                          FUN=function(status) {
+                                sum(is.na(status) | status != "SCREEN FAIL")
+                              })
+  names(Subj.count)[names(Subj.count) == "x"] <- "NUM_SUBJECTS"
+  Data <- merge(Data, Subj.count, all.x=TRUE)
+  Data[is.na(Data$NUM_SUBJECTS),"NUM_SUBJECTS"] <- 0
+
+  # Create NUM_ACTIVE_SUBJECTS and percentage
+  is.active <- (
+        Subject.site.date$SUBJ_STATUS_DERIVED != "SCREEN FAIL"
+        & !is.na(Subject.site.date$SUBJ_ENROLLED_STUDY_DT_DERIVED)
+        & Subject.site.date$SUBJ_ENROLLED_STUDY_DT_DERIVED
+            <= Subject.site.date$DATE
+        & (is.na(Subject.site.date$SUBJ_DISCONTINUED_DT)
+           | Subject.site.date$SUBJ_DISCONTINUED_DT > Subject.site.date$DATE)
+        & (is.na(Subject.site.date$SUBJ_COMPLETED_STUDY_DT)
+           | Subject.site.date$SUBJ_COMPLETED_STUDY_DT > Subject.site.date$DATE)
+        )
+  Subj.count <- aggregate(data.frame(NUM_ACTIVE_SUBJECTS=is.active),
+                          by=Subject.site.date[c("HM_SITE_ID", "DATE")],
+                          FUN=sum)
+  Data <- merge(Data, Subj.count, all.x=TRUE)
+  Data[is.na(Data$NUM_ACTIVE_SUBJECTS),"NUM_ACTIVE_SUBJECTS"] <- 0
+  Data$PCT_ACTIVE_SUBJECTS <- Data$NUM_ACTIVE_SUBJECTS / Data$NUM_SUBJECTS
+  Data[is.nan(Data$PCT_ACTIVE_SUBJECTS),"PCT_ACTIVE_SUBJECTS"] <- NA
+
+  # For the PD module, calculate the number of patients who were active at any
+  # point during the relevant time window, and also calculate the weighted
+  # average number of patients active during the window
+  if (module == "PD") {
+    Data$PATIENT_COUNT_IN_PD_VISIT <- patient_count_in_window(Data,
+                                                            Subject.site.date,
+                                                            "DATE",
+                                                            "PD_VISIT_END_DATE",
+                                                            scale=FALSE)
+    Data$PATIENT_COUNT_IN_PD_VISIT_SCALED <- patient_count_in_window(Data,
+                                                            Subject.site.date,
+                                                            "DATE",
+                                                            "PD_VISIT_END_DATE",
+                                                            scale=TRUE)
+  }
+
+  # For the Safety module, calculate the number of patients scaled by the
+  # percentage of time, between SITE_FSFV and the DATE field, when they were
+  # active
+  if (module == "SA") {
+    Data$NUM_SUBJECTS_SCALED <- patient_count_in_window(Data, Subject.site.date,
+                                                       "SITE_FSFV_DATE_DERIVED",
+                                                       "DATE",
+                                                       scale=TRUE)
+  }
+
+  # For the Turnover module, calculate the number of patients who were active at
+  # any point during the relevant time window
+  if (module == "TO") {
+    Data$PAT_COUNT_PAST_1YR <- patient_count_in_window(Data, Subject.site.date,
+                                                       "DATE_PREV_1YR", "DATE",
+                                                       scale=FALSE)
+  }
+
+
+  # Create NUM_DISCONTINUED_SUBJECTS and percentage
+  Subject.site.date$NUM_DISCONTINUED_SUBJECTS <-
+            !is.na(Subject.site.date$SUBJ_DISCONTINUED_DT) &
+              Subject.site.date$SUBJ_DISCONTINUED_DT <= Subject.site.date$DATE &
+              (is.na(Subject.site.date$SUBJ_STATUS_DERIVED)
+               | Subject.site.date$SUBJ_STATUS_DERIVED != "SCREEN FAIL")
+  Count.DC.Subj <- aggregate(Subject.site.date["NUM_DISCONTINUED_SUBJECTS"],
+                             by=Subject.site.date[c("HM_SITE_ID", "DATE")],
+                             FUN=sum)
+  Subject.site.date$NUM_DISCONTINUED_SUBJECTS <- NULL # remove temp variable
+  Data <- merge(Data, Count.DC.Subj, all.x=TRUE)
+  Data[is.na(Data$NUM_DISCONTINUED_SUBJECTS),"NUM_DISCONTINUED_SUBJECTS"] <- 0
+
+  Data$PCT_DISCONTINUED_SUBJECTS <- Data$NUM_DISCONTINUED_SUBJECTS /
+                                      Data$NUM_SUBJECTS
+  Data[is.nan(Data$PCT_DISCONTINUED_SUBJECTS),"PCT_DISCONTINUED_SUBJECTS"] <- NA
+
+  # Create PATIENT_MONTHS
+  Month.count <- aggregate(Subject.site.date$MONTHS_ACTIVE,
+                           by=Subject.site.date[c("HM_SITE_ID", "DATE")],
+                           FUN=sum)
+  names(Month.count)[names(Month.count) == "x"] <- "PATIENT_MONTHS"
+  Data <- merge(Data, Month.count, all.x=TRUE)
+  Data[is.na(Data$PATIENT_MONTHS),"PATIENT_MONTHS"] <- 0
+
+  # Create TOT_PATIENT_MONTHS_IN_STUDY_ALL_SITES
+  Month.count <- aggregate(Subject.site.date$MONTHS_ACTIVE,
+                           by=Subject.site.date[c("HM_STUDY_ID", "DATE")],
+                           FUN=sum)
+  names(Month.count)[names(Month.count) == "x"] <-
+                                         "TOT_PATIENT_MONTHS_IN_STUDY_ALL_SITES"
+  Data <- merge(Data, Month.count, all.x=TRUE)
+  Data[is.na(Data$TOT_PATIENT_MONTHS_IN_STUDY_ALL_SITES),
+       "TOT_PATIENT_MONTHS_IN_STUDY_ALL_SITES"] <- 0
+  
+
+  # Create TOT_SUBJECTS_IN_STUDY_ALL_SITES
+  # This is only needed in order to create the two variables
+  # AES and SAES_PER_PATIENT_OTHER_SITES_IN_STUDY, which are only used by the
+  # safety module.
+  if (module == "SA") {
+    # Loop over unique study-date combinations - looping is necessary to avoid
+    # using too much memory at once
+    for (study.id in intersect(Data$HM_STUDY_ID, INPUT$Subject$HM_STUDY_ID)) {
+      # Create dataset with one row per each subject in the study
+      Subjects.in.study <- INPUT$Subjects[INPUT$Subject$HM_STUDY_ID==study.id,]
+      for (dt in unique(Data[Data$HM_STUDY_ID == study.id,"DATE"])) {
+        Subjects <- Subjects.in.study
+        # Filter out subjects who do not have a confirmed status date at any
+        # time prior to the given date
+        Subjects$MIN_DATE <- pmin(Subjects$SUBJ_ENROLLED_STUDY_DT_DERIVED,
+                                  Subjects$SUBJ_DISCONTINUED_DT,
+                                  Subjects$SUBJ_COMPLETED_STUDY_DT,
+                                  na.rm=TRUE)
+        Subjects <- Subjects[!is.na(Subjects$MIN_DATE) & Subjects$MIN_DATE<=dt,]
+        if (nrow(Subjects) == 0) {
+          next # continue to next study-date if no valid subjects in date range
+        }
+  
+        # Count total subjects
+        tot.subjects <- sum(is.na(Subjects$SUBJ_STATUS_DERIVED)
+                            | Subjects$SUBJ_STATUS_DERIVED != "SCREEN FAIL")
+        ix <- which(Data$HM_STUDY_ID == study.id & Data$DATE == dt)
+        Data[ix,"TOT_SUBJECTS_IN_STUDY_ALL_SITES"] <- tot.subjects
+      } # end looping over dates for sites in the study
+    } # end looping over studies
+    Data[is.na(Data$TOT_SUBJECTS_IN_STUDY_ALL_SITES),
+         "TOT_SUBJECTS_IN_STUDY_ALL_SITES"] <- 0
+  }
+
+  return(Data)
+}
+
+
+# Wrapper function for create_patient_visit_vars_one_study - loops over studies
+# and creates patient visit variables for them, one at a time. Looping over
+# studies in this way helps to reduce memory use.
+create_patient_visit_vars <- function(Data, module) {
+  print(paste("Function - create_patient_visit_vars-",module,sep=""));
+  for (study.id in unique(Data$HM_STUDY_ID)) {
+    in.study <- Data$HM_STUDY_ID == study.id
+    Data <- rbind.fill(Data[!in.study,],
+                   create_patient_visit_vars_one_study(Data[in.study,], module))
+  }
+  return(Data)
+}
+
+# Function called from within create_patient_visit_vars which creates variables
+# for a single study - breaking this out by study helps to reduce memory use
+#
+# "Data" should be a subset of the entire modeling dataset where all the sites
+# are in the same study.
+create_patient_visit_vars_one_study <- function(Data, module) {
+  study.id <- Data[1,"HM_STUDY_ID"] # Required to be the same for all rows
+  Visits <- INPUT$Patient.visits[INPUT$Patient.visits$HM_STUDY_ID == study.id,
+                                 c("HM_SITE_ID", "MONTH_ID",
+                                   "VISIT_COUNT", "COMPLIANT_COUNT")]
+
+  # Add variable for the date as an integer in YYMMMM format
+  Data$TMPMONTH <- as.integer(format(Data$DATE, "%Y%m"))
+  # Add temporary month indexes - where Jan. 2000 = 1, Feb 2000 = 2, etc. (and
+  # Nov 1999 = -1, etc)
+#For calculations of patients visits in past 2, 6 , 12 months
+  Data$TMPMONTH <- 12 * (Data$TMPMONTH %/% 100 - 2000) + Data$TMPMONTH %% 100
+  Visits$TMPMONTH <- 12*(Visits$MONTH_ID %/% 100 - 2000) + Visits$MONTH_ID %%100
+
+
+  # Helper function for summing patient visits by month
+#Per study per site
+  f <- function(site.id, month, nmonths, varname) {
+    ix <- Visits$HM_SITE_ID == site.id &
+            month - nmonths <= Visits$TMPMONTH & Visits$TMPMONTH < month
+    return(sum(Visits[ix,varname]))
+  }
+
+  # Create patient visit count variables
+  # For SH and SA modules, we need counts of patient visits in previous 6 and 12
+  # months; for PD we need counts for previous 2, 6, and 12 months; etc.
+  if (module %in% c("SH", "SA")) {
+    VISIT.COUNT.MONTHS <- c(6, 12)
+  } else if (module == "PD") {
+    VISIT.COUNT.MONTHS <- c(2, 6, 12)
+  } else if (module == "TL") {
+    VISIT.COUNT.MONTHS <- c(1, 2, 3, 6)
+  }
+
+  for (nmonths in VISIT.COUNT.MONTHS) {
+    Data[paste0("PATIENT_VISIT_COUNT_PREV_", nmonths, "MON")] <- 
+               mapply(f, Data$HM_SITE_ID, Data$TMPMONTH, nmonths, "VISIT_COUNT")
+  }
+
+  # Create additional timely compliance variables used only by Timeliness module
+#Of the patients visits - were the on time or not -- number
+  if (module == "TL") {
+    for (nmonths in 1:3) {
+      Data[paste0("COMPLIANT_COUNT_PREV_", nmonths, "MON")] <- 
+           mapply(f, Data$HM_SITE_ID, Data$TMPMONTH, nmonths, "COMPLIANT_COUNT")
+    }
+    # Rename two variables
+    Data$PATIENT_VISIT_COUNT_PREV_MON <- Data$PATIENT_VISIT_COUNT_PREV_1MON
+    Data$PATIENT_VISIT_COUNT_PREV_1MON <- NULL
+    Data$COMPLIANT_COUNT_PREV_MON <- Data$COMPLIANT_COUNT_PREV_1MON
+    Data$COMPLIANT_COUNT_PREV_1MON <- NULL
+    # Create two calculated variables
+    Data$PATIENT_VISIT_COUNT_PREV_2MON_AGO <-(Data$PATIENT_VISIT_COUNT_PREV_2MON
+                                            - Data$PATIENT_VISIT_COUNT_PREV_MON)
+    Data$COMPLIANT_COUNT_PREV_2MON_AGO <- (Data$COMPLIANT_COUNT_PREV_2MON
+                                           - Data$COMPLIANT_COUNT_PREV_MON)
+
+    # Create timely data entry percentage variables
+    for (compliant.var in grep("^COMPLIANT_COUNT_", names(Data), value=TRUE)) {
+      suffix <- sub("COMPLIANT_COUNT_", "", compliant.var) # suffix, eg PREV_MON
+      visits.var <- paste0("PATIENT_VISIT_COUNT_", suffix)
+      timely.var <- paste0("TIMELY_DATA_ENTRY_PCT_", suffix)
+      Data[timely.var] <- Data[[compliant.var]] / Data[[visits.var]]
+      # Convert infinite values to N/As (infinites may result when denominator
+      # is zero)
+      Data[is.infinite(Data[[timely.var]]),timely.var] <- NA
+    }
+  }
+
+
+  if (module == "PD") {
+    # Create patient visit count variable at study level
+    # Helper function for summing patient visits by month, by study
+    f <- function(month) {
+      ix <- Visits$TMPMONTH < month
+      return(sum(Visits[ix,"VISIT_COUNT"]))
+    }
+
+    Data$PATIENT_VISIT_COUNT_IN_STUDY_ALL_SITES <- mapply(f, Data$TMPMONTH)
+  }
+
+  # Drop temporary variable
+  Data$TMPMONTH <- NULL
+
+  return(Data)
+}
+
+
+# Wrapper function for create_staff_turnover_dataset_one_site - loops over sites
+# and creates staff turnover variables for them, one at a time. Looping over
+# sites in this way helps to reduce memory use.
+create_staff_turnover_dataset <- function(Data, module) {
+  print(paste("Function - create_staff_turnover_dataset-",module,sep=""));
+  Staff.turnover <- data.frame()
+  for (i in 1:nrow(Data)) {
+    Staff.turnover <- rbind.fill(Staff.turnover,
+                    create_staff_turnover_dataset_one_site(Data[i,"HM_SITE_ID"],
+                                                           Data[i,"DATE"],
+                                                           module))
+  }
+  return(Staff.turnover)
+}
+
+# Function called from within create_staff_turnover_data which creates variables
+# for a single site - breaking this out by site helps to reduce memory use
+create_staff_turnover_dataset_one_site <- function(site.id, site.date, module) {
+  # Order ascending by date, with "Inactive" statuses taking precedence if on
+  # the same date as active, using ID as a tiebreaker.
+  Staff <- INPUT$Staff[INPUT$Staff$HM_SITE_ID == site.id,]
+  Staff <- Staff[order(Staff$HM_PERSON_ID,
+                       Staff$HM_SITE_ID,
+                       Staff$STATUS_DATE,
+                       Staff$CONTACT_STATUS == "ACTIVE",
+                       -Staff$HM_SITE_PERSONNEL_TURNOVER_ID),]  #Sort by decesnding HM_SITE_PERSONNEL_TURNOVER_ID
+  # Create a cleaned version of the staff dataset where consecutive identical
+  # statuses are removed - e.g. if a staff member is marked as Active on Jan 1,
+  # then is again marked as Active on Feb 1 (without ever having been marked
+  # Inactive at any point in between), we will delete the second, 2/1 status.
+  if (nrow(Staff) >= 2) { # weird errors result if this is run with 0 or 1 rows
+    Staff.next <- Staff[2:nrow(Staff),]
+    Staff.prev <- Staff[1:(nrow(Staff)-1),]
+    ix.drop <- Staff.next$HM_PERSON_ID == Staff.prev$HM_PERSON_ID &
+                 Staff.next$CONTACT_STATUS == Staff.prev$CONTACT_STATUS
+    ix.drop <- c(FALSE, ix.drop) # keep the first row
+    Staff <- Staff[!ix.drop,]
+  }
+#Needs to have an "INACTIVE" between 2 consecutive "ACTIVE"
+
+  # Create initial Staff.turnover dataset
+#HM_PERSON_ID -- is the person (and not role -- double check)
+  Staff.turnover <- Staff[c("HM_SITE_ID", "STATUS_DATE", "HM_PERSON_ID",
+                            "CONTACT_STATUS")]
+  # If no staff in the relevant time frame, just return zero-row data frame
+  # (in the calling function create_staff_turnover_dataset, this will simply
+  # result in no new rows being added, which is what we want). Need to check
+  # this before assigning DATE on the following line, since assigning to a
+  # zero-row dataframe can cause an error 
+  if (nrow(Staff.turnover) == 0) {
+    return(Staff.turnover)
+  }
+  Staff.turnover$DATE <- site.date
+  # Exclude any statuses from before the run-as-of date or the LSLV date
+  Staff.turnover <- Staff.turnover[Staff.turnover$STATUS_DATE
+                                     <= Staff.turnover$DATE,]
+  # Need to check again and return empty dataframe if no rows remain after
+  # filtering on STATUS_DATE
+  if (nrow(Staff.turnover) == 0) {
+    return(Staff.turnover)
+  }
+
+
+  by.vars <- c("HM_SITE_ID", "DATE", "HM_PERSON_ID", "CONTACT_STATUS")
+
+#This will only work if the staff is not assigned "INACTIVE" when the trial ends --- need to check
+  # Calculate first active date, last active date, and last inactive date
+#If the last active date > last inactive date then there was no-turnover
+#If there is no inactive date, then no-turnover
+
+  First.dates <- aggregate(Staff.turnover$STATUS_DATE,
+                           by=Staff.turnover[by.vars],
+                           FUN=function(dt) {
+                                 if (length(dt) == 0) as.Date(NA)
+                                 else min(dt)
+                           })
+  First.active.dates <- First.dates[First.dates$CONTACT_STATUS == "ACTIVE",
+                                   c("HM_SITE_ID", "DATE", "HM_PERSON_ID", "x")]
+  names(First.active.dates)[names(First.active.dates)=="x"]<-"FIRST_ACTIVE_DATE"
+  Last.dates <- aggregate(Staff.turnover$STATUS_DATE,
+                          by=Staff.turnover[by.vars],
+                          FUN=function(dt) {
+                                if (length(dt) == 0) as.Date(NA)
+                                else max(dt)
+                          })
+  Last.active.dates <- Last.dates[Last.dates$CONTACT_STATUS == "ACTIVE",
+                                  c("HM_SITE_ID", "DATE", "HM_PERSON_ID", "x")]
+  names(Last.active.dates)[names(Last.active.dates)=="x"] <- "LAST_ACTIVE_DATE"
+  Inactive.dates <- Last.dates[Last.dates$CONTACT_STATUS=="INACTIVE",
+                               c("HM_SITE_ID", "DATE", "HM_PERSON_ID", "x")]
+  names(Inactive.dates)[names(Inactive.dates) == "x"] <- "LAST_INACTIVE_DATE"
+  # Merge these three dataframes to create the updated Staff.turnover table
+  Staff.turnover <- merge(merge(First.active.dates, Last.active.dates,
+                                all=TRUE),
+                          Inactive.dates,
+                          all=TRUE)
+  
+  
+  # Add variable currently_active
+  Staff.turnover$CURRENTLY_ACTIVE <- (!is.na(Staff.turnover$LAST_ACTIVE_DATE)
+                                     & (is.na(Staff.turnover$LAST_INACTIVE_DATE)
+                                        | Staff.turnover$LAST_INACTIVE_DATE <
+                                            Staff.turnover$LAST_ACTIVE_DATE))
+
+  # Add current role as a variable - needed for three of the modules
+  if (module %in% c("SA", "TL", "TO")) {
+    # Get the role as of the most recent status date
+    Staff.turnover$STATUS_DATE <- pmax(Staff.turnover$LAST_ACTIVE_DATE,
+                                       Staff.turnover$LAST_INACTIVE_DATE,
+                                       na.rm=TRUE)
+    by.vars <- c("HM_SITE_ID", "HM_PERSON_ID", "STATUS_DATE")
+    Roles <- merge(Staff[c(by.vars, "CONTACT_ROLE_DERIVED")],
+                   Staff.turnover[by.vars])
+    names(Roles)[names(Roles) == "CONTACT_ROLE_DERIVED"] <- "ROLE"
+    # Create list of *unique* roles- there are a small (<1%) of cases where an
+    # employee has multiple roles at a site; in this case just take the least
+    # alphabetical role. (The reason for that is that 99% of the overlap is
+    # Sub-I's who are also Coordinators or PI's, and for the Spotfire output we
+    # only care specifically about Sub-I's and Monitors. So using the least-
+    # alphabetical role will preference Subi-I over PI/Coordinator when they
+    # conflict.)
+    Roles <- Roles[order(Roles$ROLE,decreasing=TRUE),]
+    Roles <- Roles[!duplicated(Roles[by.vars]),]
+    # Merge role back into Staff.turnover dataset
+    Staff.turnover <- merge(Staff.turnover, Roles)
+    Staff.turnover$STATUS_DATE <- NULL
+  }
+
+  return(Staff.turnover)
+}
+
+
+create_staff_vars <- function(Data, Staff.turnover, module) {
+  print(paste("Function - create_staff_vars-",module,sep=""));
+  # Create Staff.counts dataframe with counts of staff by site/date, role, and
+  # active/inactive status
+  by.vars <- c("HM_SITE_ID", "DATE", "CURRENTLY_ACTIVE")
+  if ("ROLE" %in% names(Staff.turnover)) {
+    by.vars <- c(by.vars, "ROLE") # ROLE is only used for some modules
+  }
+  Staff.counts <- aggregate(data.frame(COUNT=1:nrow(Staff.turnover)),
+                            by=Staff.turnover[by.vars],
+                            FUN=length)
+
+  # Create count of all currently active staff
+  tmp <- Staff.counts[Staff.counts$CURRENTLY_ACTIVE,]
+  tmp <- aggregate(data.frame(STAFF_COUNT=tmp$COUNT),
+                   by=tmp[c("HM_SITE_ID", "DATE")],
+                   FUN=sum)
+  Data <- merge(Data, tmp, all.x=TRUE)
+  Data[is.na(Data$STAFF_COUNT),"STAFF_COUNT"] <- 0
+
+  # Create count of staff who were active at any point in the past 6 months
+  Staff.turnover$STAFF_COUNT_PREV_6MON <- 
+                                     (Staff.turnover$CURRENTLY_ACTIVE
+                                      | (!is.na(Staff.turnover$LAST_ACTIVE_DATE)
+                                         & Staff.turnover$LAST_ACTIVE_DATE
+                                             >= Staff.turnover$DATE - 365 / 2))
+  Count.prev6 <- aggregate(Staff.turnover["STAFF_COUNT_PREV_6MON"],
+                            by=Staff.turnover[c("HM_SITE_ID", "DATE")],
+                            FUN=sum)
+  Data <- merge(Data, Count.prev6, all.x=TRUE)
+  Data[is.na(Data$STAFF_COUNT_PREV_6MON),"STAFF_COUNT_PREV_6MON"] <- 0
+  Staff.turnover$STAFF_COUNT_PREV_6MON <- NULL
+  
+
+  # Create count of staff who joined for the first time in the past 6 months
+  Staff.turnover$NUM_NEW_STAFF_PREV_6MON <- 
+                                       (!is.na(Staff.turnover$FIRST_ACTIVE_DATE)
+                                          & Staff.turnover$FIRST_ACTIVE_DATE
+                                              >= Staff.turnover$DATE - 365 / 2)
+  Count.new <- aggregate(Staff.turnover["NUM_NEW_STAFF_PREV_6MON"],
+                         by=Staff.turnover[c("HM_SITE_ID", "DATE")],
+                         FUN=sum)
+  Data <- merge(Data, Count.new, all.x=TRUE)
+  Data[is.na(Data$STAFF_COUNT_PREV_6MON),"NUM_NEW_STAFF_PREV_6MON"] <- 0
+  Staff.turnover$NUM_NEW_STAFF_PREV_6MON <- NULL
+
+  # Of currently active staff, percentage who joined in the past 6 months
+  Data$PCT_NEW_STAFF_PREV_6MON <- Data$NUM_NEW_STAFF_PREV_6MON /
+                                    Data$STAFF_COUNT_PREV_6MON
+
+  # Staff to patient ratio
+  Data$STAFF_TO_PATIENT_RATIO <- Data$STAFF_COUNT / Data$NUM_SUBJECTS
+  # Convert infinite values (due to zeros in denominator) to N/A
+  Data[is.infinite(Data$STAFF_TO_PATIENT_RATIO),"STAFF_TO_PATIENT_RATIO"] <- NA
+
+  if (module %in% c("SA", "TL")) {
+   # Create count of currently active monitors
+   tmp <- Staff.counts[Staff.counts$ROLE == "MONITOR"
+                       & Staff.counts$CURRENTLY_ACTIVE,]
+   names(tmp)[names(tmp) == "COUNT"] <- "STAFF_COUNT_MONITORS"
+   Data <- merge(Data, tmp[c("HM_SITE_ID", "DATE","STAFF_COUNT_MONITORS")],
+                 all.x=TRUE)
+   Data[is.na(Data$STAFF_COUNT_MONITORS),"STAFF_COUNT_MONITORS"] <- 0
+
+   # Monitor to patient ratio
+   Data$MONITOR_TO_PATIENT_RATIO <- Data$STAFF_COUNT_MONITORS /Data$NUM_SUBJECTS
+   # Convert infinite values (due to zeros in denominator) to N/A
+   Data[is.infinite(Data$MONITOR_TO_PATIENT_RATIO),
+        "MONITOR_TO_PATIENT_RATIO"] <- NA
+  }
+
+  # Finally, create key variables for Turnover module
+  if (module == "TO") {
+    # Create counts of Monitors and Sub-investigators who were active at any
+    # point in the past year
+    Staff.turnover$STAFF_COUNT_MONITORS_1YR <- 
+              Staff.turnover$ROLE == "MONITOR" &
+              (Staff.turnover$CURRENTLY_ACTIVE
+               | Staff.turnover$LAST_INACTIVE_DATE >= Staff.turnover$DATE - 365)
+    Staff.turnover$STAFF_COUNT_SUBI_1YR <- 
+              Staff.turnover$ROLE == "SUB INVESTIGATOR" &
+              (Staff.turnover$CURRENTLY_ACTIVE
+               | Staff.turnover$LAST_INACTIVE_DATE >= Staff.turnover$DATE - 365)
+    Count.1yr <- aggregate(Staff.turnover[c("STAFF_COUNT_MONITORS_1YR",
+                                            "STAFF_COUNT_SUBI_1YR")],
+                           by=Staff.turnover[c("HM_SITE_ID", "DATE")],
+                           FUN=sum)
+    Data <- merge(Data, Count.1yr, all.x=TRUE)
+    Data[is.na(Data$STAFF_COUNT_MONITORS_1YR),"STAFF_COUNT_MONITORS_1YR"] <- 0
+    Data[is.na(Data$STAFF_COUNT_SUBI_1YR),"STAFF_COUNT_SUBI_1YR"] <- 0
+    Staff.turnover$STAFF_COUNT_MONITORS_1YR <- NULL
+    Staff.turnover$STAFF_COUNT_SUBI_1YR <- NULL
+
+    # Create counts of Monitors and Sub-investigators who left within the past
+    # year
+    Staff.turnover$NUM_MONITORS_LEFT_1YR <- 
+                    Staff.turnover$ROLE == "MONITOR" &
+                    !Staff.turnover$CURRENTLY_ACTIVE &
+                    !is.na(Staff.turnover$LAST_ACTIVE_DATE) &
+                    Staff.turnover$LAST_ACTIVE_DATE >= Staff.turnover$DATE - 365
+    Staff.turnover$NUM_SUBI_LEFT_1YR <- 
+                    Staff.turnover$ROLE == "SUB INVESTIGATOR" &
+                    !Staff.turnover$CURRENTLY_ACTIVE &
+                    !is.na(Staff.turnover$LAST_ACTIVE_DATE) &
+                    Staff.turnover$LAST_ACTIVE_DATE >= Staff.turnover$DATE - 365
+    Count.1yr <- aggregate(Staff.turnover[c("NUM_MONITORS_LEFT_1YR",
+                                            "NUM_SUBI_LEFT_1YR")],
+                           by=Staff.turnover[c("HM_SITE_ID", "DATE")],
+                           FUN=sum)
+    Data <- merge(Data, Count.1yr, all.x=TRUE)
+    Data[is.na(Data$NUM_MONITORS_LEFT_1YR),"NUM_MONITORS_LEFT_1YR"] <- 0
+    Data[is.na(Data$NUM_SUBI_LEFT_1YR),"NUM_SUBI_LEFT_1YR"] <- 0
+    Staff.turnover$NUM_MONITORS_LEFT_1YR <- NULL
+    Staff.turnover$NUM_SUBI_LEFT_1YR <- NULL
+
+    # Calculate turnover among Monitors and Sub-Investigators
+    Data$PCT_MONITORS_LEFT_1YR <- Data$NUM_MONITORS_LEFT_1YR /
+                                    Data$STAFF_COUNT_MONITORS_1YR
+    Data$PCT_SUBI_LEFT_1YR <- Data$NUM_SUBI_LEFT_1YR / Data$STAFF_COUNT_SUBI_1YR
+    Data$PCT_MONITORS_AND_SUBI_LEFT_1YR <- (Data$NUM_MONITORS_LEFT_1YR
+                                            + Data$NUM_SUBI_LEFT_1YR) /
+                                           (Data$STAFF_COUNT_MONITORS_1YR
+                                            + Data$STAFF_COUNT_SUBI_1YR)
+  }
+
+  return(Data)
+}
+
+
+create_safety_vars <- function(Data, module) {
+  print(paste("Function - create_safety_vars-",module,sep=""));
+  ## First, site-level AE variables
+  if (module %in% c("SA", "TO")) {
+    # Create dataset with one row per site+date by each AE reported at that site
+    AE.site.date <- merge(Data[c("HM_SITE_ID", "DATE")], INPUT$AEs,
+                          by="HM_SITE_ID")
+    # Filter out AEs that were reported after the current date
+    AE.site.date <- AE.site.date[AE.site.date$AE_COLLECTION_DATE_DERIVED
+                                   <= AE.site.date$DATE,]
+  
+    # Create AE count by site
+    Counts <- aggregate(data.frame(NUM_AES_REPORTED=1:nrow(AE.site.date)),
+                        by=AE.site.date[c("HM_SITE_ID", "DATE")],
+                        FUN=length)
+    Data <- merge(Data, Counts, by=c("HM_SITE_ID", "DATE"), all.x=TRUE)
+    Data[is.na(Data$NUM_AES_REPORTED),"NUM_AES_REPORTED"] <- 0
+    # Create AE count by site, previous 12 months
+    ix <- AE.site.date$AE_COLLECTION_DATE_DERIVED >= AE.site.date$DATE - 365
+    Counts <- aggregate(data.frame(NUM_AES_REPORTED_PREV_12MON=
+                                     1:nrow(AE.site.date[ix,])),
+                         by=AE.site.date[ix,c("HM_SITE_ID", "DATE")],
+                         FUN=length)
+    Data <- merge(Data, Counts, by=c("HM_SITE_ID", "DATE"), all.x=TRUE)
+    Data[is.na(Data$NUM_AES_REPORTED_PREV_12MON),
+         "NUM_AES_REPORTED_PREV_12MON"] <- 0
+  }  
+  
+  ## Second, study-level AE variables
+  if (module == "SA") {
+    # Loop over unique study-date combinations - looping is necessary to avoid
+    # using too much memory at once
+    for (study.id in intersect(Data$HM_STUDY_ID, INPUT$AEs$HM_STUDY_ID)) {
+      # Create dataset with one row per each AE reported in the study
+      AEs.in.study <- INPUT$AEs[INPUT$AEs$HM_STUDY_ID == study.id,]
+      for (dt in unique(Data[Data$HM_STUDY_ID == study.id,"DATE"])) {
+        # Filter out AEs that were reported after the current date
+        AEs <- AEs.in.study[AEs.in.study$AE_COLLECTION_DATE_DERIVED <= dt,]
+        if (nrow(AEs) == 0) {
+          next # continue to next study-date if no valid AEs in date range
+        }
+      
+        # Create AE count by study
+        ix <- which(Data$HM_STUDY_ID == study.id & Data$DATE == dt)
+        Data[ix,"AES_IN_STUDY"] <- nrow(AEs)
+      } # end looping over dates for sites in the study
+    } # end looping over studies
+    Data[is.na(Data$AES_IN_STUDY),"AES_IN_STUDY"] <- 0
+  }
+
+
+  ## Third, site-level SAE variables
+  # Create dataset with one row per site+date by each SAE reported at that site
+  SAE.site.date <- merge(Data[c("HM_SITE_ID", "DATE")], INPUT$SAEs,
+                         by="HM_SITE_ID")
+  # Filter out SAEs that were reported after the current date
+  SAE.site.date <- SAE.site.date[SAE.site.date$INIT_RECV_DATE
+                                   <= SAE.site.date$DATE,]
+
+  # Create SAE count by site
+  Counts <- aggregate(data.frame(NUM_SAES_REPORTED=1:nrow(SAE.site.date)),
+                      by=SAE.site.date[c("HM_SITE_ID", "DATE")],
+                      FUN=length)
+  Data <- merge(Data, Counts, by=c("HM_SITE_ID", "DATE"), all.x=TRUE)
+  Data[is.na(Data$NUM_SAES_REPORTED),"NUM_SAES_REPORTED"] <- 0
+  # Create SAE count by site, previous 12 months
+  if (module == "SA") {
+    ix <- SAE.site.date$INIT_RECV_DATE >= SAE.site.date$DATE - 365
+    Counts <- aggregate(data.frame(NUM_SAES_REPORTED_PREV_12MON=
+                                     1:nrow(SAE.site.date[ix,])),
+                         by=SAE.site.date[ix,c("HM_SITE_ID", "DATE")],
+                         FUN=length)
+    Data <- merge(Data, Counts, by=c("HM_SITE_ID", "DATE"), all.x=TRUE)
+    Data[is.na(Data$NUM_SAES_REPORTED_PREV_12MON),
+         "NUM_SAES_REPORTED_PREV_12MON"] <- 0
+  }
+
+
+  ## Fourth, study-level SAE variables
+  if (module %in% c("PD", "SA")) {
+    # Loop over unique study-date combinations - looping is necessary to avoid
+    # using too much memory at once
+    for (study.id in intersect(Data$HM_STUDY_ID, INPUT$SAEs$HM_STUDY_ID)) {
+      # Create dataset with one row per each SAE reported in the study
+      SAEs.in.study <- INPUT$SAEs[INPUT$SAEs$HM_STUDY_ID == study.id,]
+      for (dt in unique(Data[Data$HM_STUDY_ID == study.id,"DATE"])) {
+        # Filter out SAEs that were reported after the current date
+        SAEs <- SAEs.in.study[SAEs.in.study$INIT_RECV_DATE <= dt,]
+        if (nrow(SAEs) == 0) {
+          next # continue to next study-date if no valid SAEs in date range
+        }
+      
+        # Create SAE count by study
+        ix <- which(Data$HM_STUDY_ID == study.id & Data$DATE == dt)
+        Data[ix,"SAES_IN_STUDY"] <- nrow(SAEs)
+      } # end looping over dates for sites in the study
+    } # end looping over studies
+    Data[is.na(Data$SAES_IN_STUDY),"SAES_IN_STUDY"] <- 0
+  }
+
+
+  ## Next, create additional calculated variables
+  if (module == "SA") {
+    Data$AES_PER_PATIENT_OTHER_SITES_IN_STUDY <-
+                   (Data$AES_IN_STUDY - Data$NUM_AES_REPORTED) /
+                      (Data$TOT_SUBJECTS_IN_STUDY_ALL_SITES - Data$NUM_SUBJECTS)
+
+    Data$SAES_PER_PATIENT_OTHER_SITES_IN_STUDY <-
+                   (Data$SAES_IN_STUDY - Data$NUM_SAES_REPORTED) /
+                      (Data$TOT_SUBJECTS_IN_STUDY_ALL_SITES - Data$NUM_SUBJECTS)
+  } else if (module == "TO") {
+    Data$AES_PER_PATIENT <- Data$NUM_AES_REPORTED / Data$NUM_SUBJECTS
+    Data$SAES_PER_PATIENT <- Data$NUM_SAES_REPORTED / Data$NUM_SUBJECTS
+  } else if (module == "PD") {
+    Data$SAES_PER_PATIENT_MONTH <- Data$NUM_SAES_REPORTED / Data$PATIENT_MONTHS
+
+    # Note: the denominator for this variable includes patient months in all
+    # sites, not just "other" sites. This is for consistency with how the
+    # variable was defined when the SAE model was built (apologies that the
+    # variable name is a little misleading)
+    Data$SAES_PER_PATIENT_MONTH_OTHER_SITES_IN_STUDY <-
+                                 (Data$SAES_IN_STUDY - Data$NUM_SAES_REPORTED) /
+                                    Data$TOT_PATIENT_MONTHS_IN_STUDY_ALL_SITES
+  }
+
+
+  # Convert certain variables to NA, rather than infinity, if the relevant
+  # denominators are zero
+  for (varname in intersect(names(Data),
+                            c("SAES_PER_PATIENT",
+                              "SAES_PER_PATIENT_MONTH",
+                              "AES_PER_PATIENT_OTHER_SITES_IN_STUDY",
+                              "SAES_PER_PATIENT_OTHER_SITES_IN_STUDY",
+                              "SAES_PER_PATIENT_MONTH_OTHER_SITES_IN_STUDY"))) {
+    Data[is.infinite(Data[[varname]]),varname] <- NA
+  }
+######################################################## New Change ######################################################################################
+##########################################################################################################################################################
+#Change AES_PER_PATIENT=0 if infinity
+  for (varname in intersect(names(Data),c("AES_PER_PATIENT"))) {
+    Data[is.infinite(Data[[varname]]),varname] <- 0;
+  }
+
+  return(Data)
+}
+
+
+
+
+create_pd_vars <- function(Data) {
+  print(paste("Function - create_pd_vars-",sep=""));
+  # Calculate the end date of the PD visit, defined as the *next* start date
+  # of a PD visit that occurs after the given date
+  f <- function(site.id, visit.date) { # helper function to get next visit date
+    ix <- INPUT$PD.monitoring$HM_SITE_ID == site.id &
+            INPUT$PD.monitoring$VISIT_START_DATE > visit.date
+    if (any(ix)) {
+      return(min(INPUT$PD.monitoring[ix,"VISIT_START_DATE"]))
+    }
+    else {
+      return(as.Date(NA))
+    }
+  }
+
+  Data$PD_VISIT_END_DATE <- mapply(f, Data$HM_SITE_ID, Data$DATE) - 1
+  Data$PD_VISIT_END_DATE <- as.Date(Data$PD_VISIT_END_DATE, R.DATE.ORIGIN)
+  # If there were no PD visits after this, try using the site LSLV date
+  ix <- is.na(Data$PD_VISIT_END_DATE) & !is.na(Data$SITE_LSLV_DATE_DERIVED) &
+    Data$SITE_LSLV_DATE_DERIVED > Data$DATE
+  Data[ix,"PD_VISIT_END_DATE"] <- Data[ix,"SITE_LSLV_DATE_DERIVED"]
+  # Use the run-as-of date if there is no date of next visit or LSLV date (or
+  # if either of those dates occurred after the run-as-of date)
+  Data$PD_VISIT_END_DATE <- pmin(RUN.DATE, Data$PD_VISIT_END_DATE, na.rm=TRUE)
+
+
+
+  # Calculate number of PDs in visit window
+  f <- function(site.id, start.date, end.date) { # helper function to sum PDs
+    ix <- INPUT$PDs$HM_SITE_ID == site.id &
+            start.date <= INPUT$PDs$DATE_DEVIATION_NOTED &
+            INPUT$PDs$DATE_DEVIATION_NOTED <= end.date
+    return(sum(ix))
+  }
+
+  Data$NUM_PDS_IN_VISIT <- mapply(f, Data$HM_SITE_ID, Data$DATE,
+                                  Data$PD_VISIT_END_DATE)
+  
+  return(Data)
+}
+
+
+
+# Helper function used by create_patient_vars to create numbers of patients in
+# a time period
+patient_count_in_window <- function(Data, Subject.site.date,
+                                    start.date.var, end.date.var, scale) {
+  # If the start and end date variables are not already in Subject.site.date,
+  # then we need to bring them in from Data
+  for (varname in c(start.date.var, end.date.var)) {
+    if (!varname %in% names(Subject.site.date)) {
+      Subject.site.date <- merge(Subject.site.date,
+                                 Data[c("HM_SITE_ID", "DATE", varname)])
+    }
+  }
+
+  # First date (if any) the patient was active during the window
+  first.active.date <- pmax(Subject.site.date$SUBJ_ENROLLED_STUDY_DT_DERIVED,
+                            Subject.site.date[[start.date.var]],
+                            na.rm=TRUE)
+  # Last date (if any) the patient was active during the window
+  last.active.date <- pmin(Subject.site.date$SUBJ_COMPLETED_STUDY_DT,
+                           Subject.site.date$SUBJ_DISCONTINUED_DT,
+                           Subject.site.date[[end.date.var]],
+                           na.rm=TRUE)
+  # Percent of days during the window when the subject was active
+  active.pct <- as.integer(last.active.date - first.active.date + 1) /
+                  as.integer(Subject.site.date[[end.date.var]]
+                             - Subject.site.date[[start.date.var]] + 1)
+  # Exclude negative values of active.pct - this would result if the subject
+  # dropped out before the window started, started after the window ended, or
+  # in unusual cases where enrolled date might be after completed or
+  # discontinued date
+  active.pct <- pmax(0., active.pct)
+  # Exclude screen fail subjects
+  active.pct[!is.na(Subject.site.date$SUBJ_STATUS_DERIVED)
+             & Subject.site.date$SUBJ_STATUS_DERIVED == "SCREEN FAIL"] <- 0.
+
+  # If we are not scaling by the time they were active, then just convert
+  # active.pct to 1 if active and 0 if inactive
+###This is treated as a boolean and not as a percentage if scale=FASLE
+  if (!scale) {
+    active.pct <- ceiling(active.pct)
+  }
+
+  Subj.count <- aggregate(active.pct,
+                          by=Subject.site.date[c("HM_SITE_ID", "DATE")],
+                          FUN=sum)
+  Data$.order. <- 1:nrow(Data)
+  Data <- merge(Data, Subj.count, all.x=TRUE)
+  Data <- Data[order(Data$.order.),] # keep data in original order after merge
+  Data[is.na(Data$x),"x"] <- 0
+
+  return(Data$x)
+}
+
+
+create_misc_vars <- function(Data) {
+  print(paste("Function - create_misc_vars-",sep=""));
+  # Create variable: NUM_STUDY_SITES = total number of sites for a given study,
+  # where site FSFV date is before the given date (to avoid looking ahead)
+  f <- function(study.id, site.date) {
+    return(sum(INPUT$Sites$HM_STUDY_ID == study.id
+               & !is.na(INPUT$Sites$SITE_FSFV_DATE_DERIVED)
+               & INPUT$Sites$SITE_FSFV_DATE_DERIVED <= site.date))
+  }
+
+  # Set num study sites to a minimum of 1, to include this site itself. (The
+  # results of the helper function f could potentially be negative for
+  # observations in the PD module corresponding to past PD monitoring visit
+  # that took place prior to the FSFV date)
+  Data$NUM_STUDY_SITES <- pmax(1, mapply(f, Data$HM_STUDY_ID, Data$DATE))
+
+  # Number of days that site has gone unmonitored
+  Data$UNMONITORED_SITE_DAYS <- ifelse(Data$IND_PREV_REPORTS,
+                                       Data$DAYS_SINCE_LAST_REPORT,
+                                       ifelse(!is.na(Data$DAYS_SINCE_SITE_FSFV),
+                                              Data$DAYS_SINCE_SITE_FSFV,
+                                              0))
+
+
+  # Region
+  Regions.map <- read.csv("Data/Misc/Regions.csv", as.is=TRUE)
+  Regions.map <- Regions.map[c("name", "subregion")]
+  names(Regions.map) <- c("COUNTRY_NAME", "REGION")
+  Regions.map$COUNTRY_NAME <- toupper(Regions.map$COUNTRY_NAME)
+  Data <- merge(Data, Regions.map, all.x=TRUE, by="COUNTRY_NAME")
+  Data$REGION <- as.factor(Data$REGION)
+  missing.region <- which(is.na(Data$REGION) & !is.na(Data$COUNTRY_NAME))
+  if (length(missing.region) > 0) {
+    cat("WARNING: The following country names were not found in the country-",
+        "to-region mapping file: ",
+        paste(unique(Data[missing.region,"COUNTRY_NAME"]), collapse=", "), "\n",
+        file=log_con)
+  }
+
+  return(Data)
+}
+
+
+

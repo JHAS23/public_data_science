@@ -1,0 +1,5 @@
+#!/bin/bash 
+
+source ~/.bash_profile
+
+R CMD BATCH Safety_Module.R output/Safety_Module.out
