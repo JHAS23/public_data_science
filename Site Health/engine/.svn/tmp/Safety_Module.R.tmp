@@ -1,0 +1,331 @@
+####################################################################################################
+# THIS PROGRAM CREATES THE TRAINING DATSET FOR THE SAFETY MODULE AND RUNS THE RELEVANT REGRESSION MODELS
+#
+# File Version: 1.0
+# Last Modified: 2015-JUN-23		
+#  
+####################################################################################################
+rm(list=ls())
+
+
+wrkDir <- Sys.getenv("R_TMP")
+setwd(wrkDir)
+
+library(plyr)
+library(MASS)
+
+source("/app/r/engine/SiteHealthLogger.R")
+source("/app/r/engine/RODBCDataFetch.R")
+
+logInfo("Reading in SAE Data from the Data Mart WRK Area Views...")
+
+
+
+##### AR : READ IN INPUT FILES####################################
+
+study_data <- getSafetyStudyData()
+site_data <- getSafetySiteData()
+subject_file <- getSafetySubjectData()
+sae_file <- getSAEData()
+AEData <- getAEData()
+or_file<- getSAEOSData()
+rcat_file <- getSAEOSCounts()
+
+logInfo("Done reading in SAE Data from the DM...")
+
+AEData$AE_COLLECTION_DATE_DERIVED<-as.Date(AEData$AE_COLLECTION_DATE_DERIVED)
+
+sae_file$INIT_RECV_DATE<-as.Date(sae_file$INIT_RECV_DATE)
+sae_file$INVESTIGATOR_INIT_AWARE_DATE<-as.Date(sae_file$INVESTIGATOR_INIT_AWARE_DATE)  
+
+subject_file$SUBJ_COMPLETED_STUDY_DT<-as.Date(subject_file$SUBJ_COMPLETED_STUDY_DT)
+subject_file$SUBJ_DISCONTINUED_DT<-as.Date(subject_file$SUBJ_DISCONTINUED_DT)
+subject_file$SUBJ_ENROLLED_STUDY_DT<-as.Date(subject_file$SUBJ_ENROLLED_STUDY_DT)
+subject_file$SUBJ_ENROLLED_STUDY_DT_DERIVED<-as.Date(subject_file$SUBJ_ENROLLED_STUDY_DT_DERIVED)
+
+or_file$REPORT_START_DATE<-as.Date(or_file$REPORT_START_DATE)
+or_file$REPORT_END_DATE<-as.Date(or_file$REPORT_END_DATE)
+
+site_data$SITE_FSFV_DATE_DERIVED<-as.Date(site_data$SITE_FSFV_DATE_DERIVED)
+site_data$SITE_LSLV_DATE_DERIVED<-as.Date(site_data$SITE_LSLV_DATE_DERIVED)
+
+study_useCt<-nrow(study_data)
+site_useCt<-nrow(site_data)
+logInfo("Studies available for use -> YN_EXCLUDED=N and YN_SAE_EXCLUDED=N:", study_useCt)
+logInfo("Sites available for use -> YN_EXCLUDED=N and YN_SAE_EXCLUDED=N:", site_useCt)
+
+subjectCt<-nrow(subject_file)
+logInfo("Subject data count before sub-setting: removing Screen Failures ", subjectCt)
+
+subject_file<-subject_file[subject_file$SUBJ_STATUS_DERIVED!= "SCREEN FAIL",]
+
+subjectCt<-nrow(subject_file)
+logInfo("Subject data count after sub-setting: removing Screen Failures ", subjectCt)
+
+
+####################################################################
+
+##### AR : Create SAE Reporting Lag Variable #############
+
+logInfo("Create SAE Reporting Lag Variable...")	
+
+sae_file$sae_lag_days<-as.numeric(sae_file$INIT_RECV_DATE -sae_file$INVESTIGATOR_INIT_AWARE_DATE)
+sae_file$sae_delayed<-ifelse(sae_file$sae_lag_days>1,1,0)###AR: MAKES IT BINARY
+sae_file$sae_delayed<-ifelse(is.na(sae_file$sae_delayed),0,sae_file$sae_delayed)
+
+logInfo("Reporting Lag Variable Created")  
+
+
+##AR: SAE COUNT AGGREGATOR - Counts NO. OF SAEs and SAE DELAYs relative to Oversight Report Date###
+
+logInfo("Counting SAE and SAE Delays in analysis period...")  
+
+for(k in 1:nrow(or_file)){
+  or_file$saecount[k]<-sum(sae_file$HM_SITE_ID==or_file$HM_SITE_ID[k]& or_file$REPORT_START_DATE[k]- sae_file$INIT_RECV_DATE >= 0 & or_file$REPORT_START_DATE[k]- sae_file$INIT_RECV_DATE <=365 )
+  or_file$SAE_DELAYS_COUNT[k]<-sum(sae_file$HM_SITE_ID==or_file$HM_SITE_ID[k]&sae_file$INIT_RECV_DATE<=or_file$REPORT_START_DATE[k] & sae_file$sae_delayed==1,na.rm=TRUE)
+}
+
+logInfo("Count completed")  
+
+
+summary(or_file$SAE_DELAYS_COUNT)
+
+##AR:AE COUNT AGGREGATOR - Counts NO. OF AEs relative to Oversight Report Date###
+
+logInfo("Counting AEs in analysis period...")  
+
+
+or_file$aecount<-NA
+ for(i in 1:nrow(or_file)){
+   or_file$aecount[i]<-sum(AEData$HM_SITE_ID==or_file$HM_SITE_ID[i]& or_file$REPORT_START_DATE[i]- AEData$AE_COLLECTION_DATE_DERIVED >= 0 & or_file$REPORT_START_DATE[i]- AEData$AE_COLLECTION_DATE_DERIVED<=365,na.rm=TRUE)
+}
+
+logInfo("Count completed")  
+
+summary(or_file$aecount)
+
+##AR:SUBJECT COUNT AGGREGATOR - Counts NO. OF Subjects relative to Oversight Report Date###
+logInfo("Calculating Subject count and scaled subject count...")  
+
+or_file$subject_count<-NA
+or_file$subject_count_scaled<-NA
+for(j in 1:nrow(or_file)){
+  or_file$subject_count[j]<-sum(subject_file$HM_SITE_ID==or_file$HM_SITE_ID[j]&subject_file$SUBJ_ENROLLED_STUDY_DT_DERIVED<=or_file$REPORT_START_DATE[j] & (is.na(subject_file$SUBJ_COMPLETED_STUDY_DT)|or_file$REPORT_START_DATE[j]-subject_file$SUBJ_COMPLETED_STUDY_DT<=365)& (is.na(subject_file$SUBJ_DISCONTINUED_DT)|or_file$REPORT_START_DATE[j]-subject_file$SUBJ_DISCONTINUED_DT<=365),na.rm=TRUE)
+  or_file$subject_count_scaled[j]<-sum(pmin((or_file$REPORT_START_DATE[j]-subject_file$SUBJ_ENROLLED_STUDY_DT_DERIVED)/365,1)*(subject_file$HM_SITE_ID==or_file$HM_SITE_ID[j]&subject_file$SUBJ_ENROLLED_STUDY_DT_DERIVED<=or_file$REPORT_START_DATE[j] & (is.na(subject_file$SUBJ_COMPLETED_STUDY_DT)|or_file$REPORT_START_DATE[j]-subject_file$SUBJ_COMPLETED_STUDY_DT<=365)& (is.na(subject_file$SUBJ_DISCONTINUED_DT)|or_file$REPORT_START_DATE[j]-subject_file$SUBJ_DISCONTINUED_DT<=365)),na.rm=TRUE) # If subject has been active for 365 days or longer count as 1 else scale
+ }
+
+logInfo("Count completed")  
+
+
+summary(or_file$subject_count)
+summary(or_file$subject_count_scaled)
+
+##AR:ISSUE COUNT AGGREGATOR - Counts NO. OF ISSUES Associated with Oversight Report###
+
+logInfo("Calculating Issue Counts...")  
+
+issue_counts<- ddply(rcat_file,.(HM_GL_IN_OVERSIGHT_REPORTS_ID),summarise,ISSUE_COUNT=sum(RISK_CATEGORY_COUNT[which(RISK_CATEGORY!="TOTAL ISSUES")]))
+
+logInfo("Count completed")  
+
+logInfo("MERGING SITE FEATURES,ISSUE COUNTS,OVERSIGHT REPORTS AND COUNTS TO CREATE ANALYSIS DATASET...")  
+
+#####AR : MERGE SITE FEATURES,ISSUE COUNTS,OVERSIGHT REPORTS AND COUNTS########### 
+analysis_dataset<-merge(or_file,issue_counts,by="HM_GL_IN_OVERSIGHT_REPORTS_ID",all.x=T)
+analysis_dataset<-merge(analysis_dataset,site_data[,c(1,5,7,9,12,17)],by="HM_SITE_ID",all.x=T)
+analysis_dataset<-merge(analysis_dataset,study_data[,c(1,4,6)],by="HM_STUDY_ID",all.x=T)
+analysis_dataset<-unique(analysis_dataset)
+
+##########AR : CREATE STUDY DURATION VARIABLE#####################################
+analysis_dataset$study_duration<-as.numeric(analysis_dataset$REPORT_START_DATE - analysis_dataset$SITE_FSFV_DATE_DERIVED)
+
+
+logInfo("ANALYSIS DATASET CREATED")  
+
+logInfo("APPLYING RULES FOR OUTLIERS AND MISSING VALUES...")  
+
+#########AR: HANDLING OUTLIERS AND MISSING VALUES###########
+
+analysis_dataset$ISSUE_COUNT<-ifelse(is.na(analysis_dataset$ISSUE_COUNT),0,analysis_dataset$ISSUE_COUNT)
+analysis_dataset$study_duration<-ifelse(analysis_dataset$study_duration<0,NA,analysis_dataset$study_duration)
+
+                  ####AR: Quick Plots to check data###
+#qplot(log(analysis_dataset$aecount),geom="histogram")
+#qplot(log(analysis_dataset$saecount),geom="histogram")
+#qplot(analysis_dataset$ISSUE_COUNT,geom="histogram")
+#qplot(analysis_dataset$subject_count_scaled)
+#qplot(analysis_dataset$study_duration)
+#summary(analysis_dataset$study_duration)
+#sum(analysis_dataset$subject_count!=0)
+
+analysis_dataset2<-analysis_dataset[(analysis_dataset$subject_count>0 & analysis_dataset$aecount<200 & !is.na(analysis_dataset$study_duration) & analysis_dataset$ISSUE_COUNT<45),] # AR: Remove outliers and datapoints that don't make sense###
+analysis_dataset3<-analysis_dataset2
+#summary(analysis_dataset2)
+#analysis_dataset2$aeprop<-analysis_dataset2$aecount/analysis_dataset2$subject_count_scaled
+#analysis_dataset2$saeprop<-analysis_dataset2$saecount/analysis_dataset2$subject_count_scaled
+
+#analysis_dataset3<-transform(analysis_dataset2, freq.loc = ave(seq(nrow(analysis_dataset2)), COUNTRY_NAME, FUN=length))
+#analysis_dataset3$COUNTRY_NAME<-ifelse(analysis_dataset3$freq.loc<=50,"OTHER",as.character(analysis_dataset3$COUNTRY_NAME))
+analysis_dataset3$COUNTRY_NAME<-as.factor(analysis_dataset3$COUNTRY_NAME)
+
+#################### AR : Expected Values & Residuals#############################
+
+logInfo("BUILDING AE AND SAE EXPECTATION MODELS...")  
+
+model_sae<-lm(saecount~aecount+subject_count_scaled+study_duration+STUDY_THERAPEUTIC_AREA+COUNTRY_NAME+DEVELOPMENT_PHASE,data=analysis_dataset3)
+model_ae<-lm(aecount~subject_count_scaled+study_duration+STUDY_THERAPEUTIC_AREA+COUNTRY_NAME+DEVELOPMENT_PHASE,data=analysis_dataset3)
+#model_delay<-lm(SAE_DELAYS_COUNT~saecount+aecount+subject_count+study_duration+STUDY_THERAPEUTIC_AREA+COUNTRY_NAME+DEVELOPMENT_PHASE,data=analysis_dataset2)
+
+analysis_dataset3$pred_sae<-predict(model_sae)
+analysis_dataset3$pred_ae<-predict(model_ae)
+#analysis_dataset3$pred_delay<-predict(model_delay)
+
+analysis_dataset3$pred_sae<-ifelse(analysis_dataset3$pred_sae<0,0,analysis_dataset3$pred_sae)
+analysis_dataset3$pred_ae<-ifelse(analysis_dataset3$pred_ae<0,0,analysis_dataset3$pred_ae)
+
+
+analysis_dataset3$sae_delta<-analysis_dataset3$saecount-analysis_dataset3$pred_sae
+analysis_dataset3$ae_delta<-analysis_dataset3$aecount-analysis_dataset3$pred_ae
+#analysis_dataset3$saedelaydelta<-analysis_dataset2$SAE_DELAYS_COUNT-analysis_dataset2$pred_delay
+
+logInfo("MODELS BUILT")  
+
+###################################AR : Safety Model#############################
+
+logInfo("BUILDING SAFETY MODEL...")  
+model<-lm(ISSUE_COUNT~ae_delta+aecount+sae_delta+SAE_DELAYS_COUNT*saecount+study_duration+STUDY_THERAPEUTIC_AREA+COUNTRY_NAME +DEVELOPMENT_PHASE,na.action=na.exclude,data=analysis_dataset3)
+summary(model)
+
+model2<-lm(ISSUE_COUNT~ae_delta+aecount+sae_delta+SAE_DELAYS_COUNT*saecount+study_duration,na.action=na.exclude,data=analysis_dataset3)
+summary(model2)
+logInfo("SAFETY MODEL BUILT")  
+
+
+############################AR: Safety Module DEV TEST PREDICTIONS + OUTPUT#####################
+logInfo("APPLYING MODEL PREDICTIONS TO CURRENT RUN DATA...")  
+
+
+dataAE<-AEData[Sys.Date()-AEData$AE_COLLECTION_DATE_DERIVED<=365,]
+outputAE<-ddply(dataAE,.(HM_SITE_ID),summarise,aecount=sum(length(HM_SITE_ID),na.rm=T))
+outputAE<-unique(outputAE)
+
+dataSAE<-sae_file[Sys.Date()-sae_file$INIT_RECV_DATE<=365,]
+outputSAE<-ddply(dataSAE,.(HM_SITE_ID),summarise,SAE_DELAYS_COUNT=sum(sae_delayed,na.rm=T),saecount=sum(length(HM_SITE_ID),na.rm=T))
+
+
+dataSubject<-subject_file[subject_file$SUBJ_ENROLLED_STUDY_DT_DERIVED<=Sys.Date() & (is.na(subject_file$SUBJ_COMPLETED_STUDY_DT)|Sys.Date()-subject_file$SUBJ_COMPLETED_STUDY_DT<=365)& (is.na(subject_file$SUBJ_DISCONTINUED_DT)|Sys.Date()-subject_file$SUBJ_DISCONTINUED_DT<=365),]
+dataSubject$scale_factor<-(Sys.Date()-dataSubject$SUBJ_ENROLLED_STUDY_DT_DERIVED)/365
+dataSubject$scale_factor<-ifelse(dataSubject$scale_factor>=1,1,dataSubject$scale_factor)
+dataSubject<-unique(dataSubject)
+dataSubject<-dataSubject[!(is.na(dataSubject$HM_SITE_ID)|is.na(dataSubject$SUBJ_STATUS_DERIVED)|dataSubject$SUBJ_STATUS_DERIVED=='SCREEN FAIL'),]
+outputSubject<-ddply(dataSubject,.(HM_SITE_ID),summarise,subject_count=length(HM_SITE_ID),subject_count_scaled=sum(scale_factor*1))
+length(outputSubject[outputSubject$subject_count!=outputSubject$subject_count_scaled,])
+
+dataStudy<-study_data[study_data$YN_EXCLUDED=='N',c(1,4,6,20)]
+dataSite<-site_data[site_data$YN_EXCLUDED=='N',c(1,2,4,5,6,7,9)]
+dataSite<-dataSite[!is.na(dataSite$SITE_FSFV_DATE_DERIVED),]
+
+dataComb1<-merge(dataStudy,dataSite,by='HM_STUDY_ID')
+dataComb1<-dataComb1[is.na(dataComb1$SITE_LSLV_DATE_DERIVED)|Sys.Date()-dataComb1$SITE_LSLV_DATE_DERIVED<=1095.73,]
+dataComb1<-unique(dataComb1)
+
+dataComb2<-merge(dataComb1,outputAE,by='HM_SITE_ID',all.x=T)
+dataComb3<-merge(dataComb2,outputSAE,by='HM_SITE_ID',all.x=T)
+dataComb4<-merge(dataComb3,outputSubject,by='HM_SITE_ID',all.x=T)
+dataComb4$study_duration<-as.numeric(Sys.Date() - dataComb4$SITE_FSFV_DATE_DERIVED)
+dataComb4<-dataComb4[!is.na(dataComb4$subject_count),]
+summary(dataComb4)
+
+
+dataComb4$aecount<-ifelse(is.na(dataComb4$aecount),0,dataComb4$aecount)
+dataComb4$saecount<-ifelse(is.na(dataComb4$saecount),0,dataComb4$saecount)
+dataComb4$SAE_DELAYS_COUNT<-ifelse(is.na(dataComb4$SAE_DELAYS_COUNT),0,dataComb4$SAE_DELAYS_COUNT)
+#datacomb4$subject_count<-ifelse(is.na(datacomb4$subject_count),0,datacomb4$subject_count)
+#datacomb4$subject_count_scaled<-ifelse(is.na(datacomb4$subject_count_scaled),0,datacomb4$subject_count_scaled)
+
+#dataComb5<-transform(dataComb4, freq.loc = ave(seq(nrow(dataComb4)), COUNTRY_NAME, FUN=length))
+#dataComb5$COUNTRY_NAME<-ifelse(dataComb5$freq.loc<=50,"OTHER",as.character(dataComb5$COUNTRY_NAME))
+dataComb5<-dataComb4
+dataComb5$COUNTRY_NAME<-as.factor(dataComb5$COUNTRY_NAME)
+
+model_sae2<-lm(saecount~aecount+subject_count_scaled+study_duration+STUDY_THERAPEUTIC_AREA+COUNTRY_NAME+DEVELOPMENT_PHASE,data=dataComb5)
+model_ae2<-lm(aecount~subject_count_scaled+study_duration+STUDY_THERAPEUTIC_AREA+COUNTRY_NAME+DEVELOPMENT_PHASE,data=dataComb5)
+
+# 2016-APR-13 - comment out due to error
+# Added two lines below 
+#dataComb5$pred_sae<-predict(model_sae2)
+#dataComb5$pred_ae<-predict(model_ae2)
+
+dataComb5$pred_sae<-predict(model_sae2, newdata=dataComb5, type="response")
+dataComb5$pred_ae<-predict(model_ae2, newdata=dataComb5,type="response")
+
+
+dataComb5$pred_sae<-ifelse(dataComb5$pred_sae<0,0,dataComb5$pred_sae)
+dataComb5$pred_ae<-ifelse(dataComb5$pred_ae<0,0,dataComb5$pred_ae)
+
+
+dataComb5$sae_delta<-dataComb5$saecount-dataComb5$pred_sae
+dataComb5$ae_delta<-dataComb5$aecount-dataComb5$pred_ae
+
+
+id <- which(!(dataComb5$COUNTRY_NAME %in% unique(analysis_dataset3$COUNTRY_NAME)))
+dataComb5$COUNTRY_NAME[id] <- NA
+class(dataComb5$COUNTRY_NAME)
+
+id2 <- which(!(dataComb5$STUDY_THERAPEUTIC_AREA %in% unique(analysis_dataset3$STUDY_THERAPEUTIC_AREA)))
+dataComb5$STUDY_THERAPEUTIC_AREA[id2] <- NA
+class(dataComb5$STUDY_THERAPEUTIC_AREA)
+
+dataComb5$OS_ISSUE_COUNT_EXPECTED<-predict(model,newdata=dataComb5)
+dataComb5$OS_ISSUE_COUNT_EXPECTED<-ifelse(is.na(dataComb5$OS_ISSUE_COUNT_EXPECTED),predict(model2,newdata=dataComb5),dataComb5$OS_ISSUE_COUNT_EXPECTED)
+
+dataComb5$OS_ISSUE_COUNT_EXPECTED<-ifelse(dataComb5$OS_ISSUE_COUNT_EXPECTED<0,0,dataComb5$OS_ISSUE_COUNT_EXPECTED)
+
+
+
+
+dataComb5$pred_issuecount_pctle <- rank(dataComb5$OS_ISSUE_COUNT_EXPECTED)/length(dataComb5$OS_ISSUE_COUNT_EXPECTED)
+summary(dataComb5$pred_issuecount_pctle)
+
+
+dataComb5$sae_delta_pctle <-rank(dataComb5$sae_delta)/length(dataComb5$sae_delta)
+summary(dataComb5$sae_delta_pctle)
+dataComb5$ae_delta_pctle <- rank(dataComb5$ae_delta)/length(dataComb5$ae_delta)
+summary(dataComb5$ae_delta_pctle)
+dataComb5$SAFETY_PERIOD_START<-Sys.Date()-365
+dataComb5$SAFETY_PERIOD_START[dataComb5$SITE_FSFV_DATE_DERIVED>=Sys.Date()-365]<-dataComb5$SITE_FSFV_DATE_DERIVED[dataComb5$SITE_FSFV_DATE_DERIVED>=Sys.Date()-365]
+summary(dataComb5$SAFETY_PERIOD_START)
+
+dataComb5$SAFETY_PERIOD_LENGTH<-Sys.Date()-dataComb5$SAFETY_PERIOD_START
+dataComb5$SAFETY_PERIOD_LENGTH <- as.numeric(dataComb5$SAFETY_PERIOD_LENGTH, units="days")
+
+logInfo("PREDICTIONS COMPLETE")  
+
+logInfo("PREPARING DATA FOR OUTPUT")  
+
+# Save for SH Scoring module
+save(dataComb5, file="SAFETY_Model.Rdata", ascii=FALSE)
+
+# Adjust and Rename Variables for Output to the Data Mart 
+SAFETY_OUT<-dataComb5[dataComb5$YN_VISUALIZE=='Y',]
+SAFETY_OUT$HM_WRK_SAFETY_OUT_ID <- NA
+  
+SAFETY_OUT<-SAFETY_OUT[,c("HM_WRK_SAFETY_OUT_ID", "HM_SITE_ID", "HM_STUDY_ID","subject_count", "subject_count_scaled", "SAFETY_PERIOD_START","SAFETY_PERIOD_LENGTH",
+                    "OS_ISSUE_COUNT_EXPECTED", "pred_issuecount_pctle", "sae_delta_pctle", "ae_delta_pctle","aecount", "pred_ae", "saecount",
+                    "pred_sae")]
+
+names(SAFETY_OUT)<- c("HM_WRK_SAFETY_OUT_ID", "HM_SITE_ID", "HM_STUDY_ID","SAFETY_PATIENT_COUNT", "SAFETY_PATIENT_COUNT_SCALE", "SAFETY_PERIOD_START","SAFETY_PERIOD_LENGTH","OS_ISSUE_COUNT_EXPECTED", "SAFETY_PERCENTILE", "SAE_PERCENTILE","AE_PERCENTILE" ,"AE_COUNT", "AE_COUNT_EXPECTED", "SAE_COUNT",
+                     "SAE_COUNT_EXPECTED")
+
+logInfo("WRITING DATA INTO DATA TO WRK_SAFETY_OUT")  
+
+
+# Insert into WRK_PD_OUT using RODBCDataInsert function
+source("/app/r/engine/RODBCDataInsert.R")
+insertSafetyOut(SAFETY_OUT)
+
+logInfo("Completed saving Safety Model results to WRK_SAFETY_OUT...")
+logInfo("<DONE> - Exiting Safety Module...")
+
+### END OF APPLICATION OF MODEL COEFFICIENTS TO ONGOING STUDIES ### 
+

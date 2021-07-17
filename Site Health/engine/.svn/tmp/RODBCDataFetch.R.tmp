@@ -1,0 +1,289 @@
+##############################################################################################
+# RODBCFetchNew.R - Reads in data from the Data Mart as a data frame.  Allows saving to a
+#  Rdata file for later use.
+#
+# File Version: 1.1 
+# Last Modified: 2015-AUG-10 
+# Last Modified by: Brett Favro
+# 
+##############################################################################################
+
+library(RODBC)
+wrkDir <- Sys.getenv("R_TMP")
+setwd(wrkDir)
+
+#channel <- odbcConnect("enid195.pfizer.com")
+
+getOracleData <- function(tableName, saveToFile) {
+	tnsName <- readLines("../database.name", encoding="UTF-8")	
+	channel <- odbcConnect(tnsName)	
+	data <- sqlQuery(channel, paste("SELECT * FROM", tableName, sep=" "))
+	if (isTRUE(saveToFile)) {
+		saveRDS(data, file=paste(strsplit(tableName, "\\.")[[1]][2],"Rdata", sep="."))
+	}
+	close(channel)
+	
+	return (data)
+}
+
+
+######################
+# PROTOCOL DEVIATIONS
+######################
+
+getPDData <- function(saveToFile=FALSE) {
+	pdData <- getOracleData("HM_DM_WRK_OWNER.V_W_PD_IN_PROTOCOL_DEVIATION", saveToFile)
+	return (pdData)
+}
+
+getPDSiteVisits <- function(saveToFile=FALSE) {
+	pdSiteVisits <- getOracleData("HM_DM_WRK_OWNER.V_W_PD_IN_SITE_VISIT", saveToFile)
+	return (pdSiteVisits)
+}
+
+getPDOSData <- function(saveToFile=FALSE) {
+	pdOSData <- getOracleData("HM_DM_WRK_OWNER.V_W_PD_IN_OVERSIGHT_REPORTS", saveToFile)
+	return (pdOSData)
+}
+	
+getPDOSCounts <- function(saveToFile=FALSE) {
+	pdOSCounts <- getOracleData("HM_DM_WRK_OWNER.V_W_PD_IN_OR_RISK_CAT_COUNTS", saveToFile)
+	return (pdOSCounts)
+}
+	
+getPDParameters <- function(saveToFile=FALSE) {
+	pdParameters <- getOracleData("HM_DM_WRK_OWNER.V_W_PD_IN_PARAMETERS", saveToFile)
+	return (pdParameters)
+}
+
+#########################
+# SAFETY 
+#########################
+
+getSAEData <- function(saveToFile=FALSE) {
+        saeData <- getOracleData("HM_DM_WRK_OWNER.V_W_SAE_IN_SAE_CASE", saveToFile)
+        return (saeData)
+}
+
+getAEData <- function(saveToFile=FALSE) {
+	aeData <- getOracleData("HM_DM_WRK_OWNER.V_W_AE_IN_ADVERSE_EVENT", saveToFile)
+	return (aeData)
+} 
+
+getSAEOSData <- function(saveToFile=FALSE) {
+        saeOSData <- getOracleData("HM_DM_WRK_OWNER.V_W_SAE_IN_OVERSIGHT_REPORTS", saveToFile)
+        return (saeOSData)
+}
+
+getSAEOSCounts <- function(saveToFile=FALSE) {
+        saeOSCounts <- getOracleData("HM_DM_WRK_OWNER.V_W_SAE_IN_OR_RISK_CAT_COUNTS", saveToFile)
+        return (saeOSCounts)
+}
+
+getSAEParameters <- function(saveToFile=FALSE) {
+        saeParameters <- getOracleData("HM_DM_WRK_OWNER.V_W_SAE_IN_PARAMETERS", saveToFile)
+        return (saeParameters)
+}
+
+
+####################
+# RESOURCE TURNOVER
+####################
+
+getRTData <- function(saveToFile=FALSE) {
+	rtData <- getOracleData("HM_DM_WRK_OWNER.V_W_RT_IN_SITE_PERS_TURNOVER", saveToFile)
+	return (rtData)
+}
+	
+getRTOSData <- function(saveToFile=FALSE) {
+	rtOSData <- getOracleData("HM_DM_WRK_OWNER.V_W_RT_IN_OVERSIGHT_REPORTS", saveToFile)
+	return (rtOSData)
+}
+	
+getRTOSCounts <- function(saveToFile=FALSE) {
+	rtOSCounts <- getOracleData("HM_DM_WRK_OWNER.V_W_RT_IN_OR_RISK_CAT_COUNTS", saveToFile)
+	return (rtOSCounts)
+}
+	
+getRTParameters <- function(saveToFile=FALSE) {
+	rtParameters <- getOracleData("HM_DM_WRK_OWNER.V_W_RT_IN_PARAMETERS", saveToFile)
+	return (rtParameters)
+}
+
+#############
+# TIMELINESS
+#############
+
+getTLData <- function(saveToFile=FALSE) {
+	tlData <- getOracleData("HM_DM_WRK_OWNER.V_W_TL_IN_CRF_DATA_ENTRY_COMPL", saveToFile)
+	return (tlData)
+}
+	
+getTLOSData <- function(saveToFile=FALSE) {
+	tlOSData <- getOracleData("HM_DM_WRK_OWNER.V_W_TL_IN_OVERSIGHT_REPORTS", saveToFile)
+	return (tlOSData)
+}
+	
+getTLOSCounts <- function(saveToFile=FALSE) {
+	tlOSCounts <- getOracleData("HM_DM_WRK_OWNER.V_W_TL_IN_OR_RISK_CAT_COUNTS", saveToFile)
+	return (tlOSCounts)
+}
+	
+getTLParameters <- function(saveToFile=FALSE) {
+	tlParameters <- getOracleData("HM_DM_WRK_OWNER.V_W_TL_IN_PARAMETERS", saveToFile)
+	return (tlParameters)
+}
+
+
+#############
+# MONITORING 
+#############
+
+getMIMonitoringData <- function(saveToFile=FALSE) {
+        miMonitoringData <- getOracleData("HM_DM_WRK_OWNER.V_W_MI_IN_MONITORING_VISIT", saveToFile)
+        return (miMonitoringData)
+}
+
+getMIOSData <- function(saveToFile=FALSE) {
+        miOSData <- getOracleData("HM_DM_WRK_OWNER.V_W_MI_IN_OVERSIGHT_REPORTS", saveToFile)
+        return (miOSData)
+}
+
+getMIOSQuestionData <- function(saveToFile=FALSE) {
+        miOSQuestionData <- getOracleData("HM_DM_WRK_OWNER.V_W_MI_IN_OR_QUESTIONS", saveToFile)
+        return (miOSQuestionData)
+}
+
+getMIOSIssueData <- function(saveToFile=FALSE) {
+        miOSIssueData <- getOracleData("HM_DM_WRK_OWNER.V_W_MI_IN_OR_ISSUES", saveToFile)
+        return (miOSIssueData)
+}
+
+#############
+# STUDY DATA
+#############
+
+getPDStudyData <- function(saveToFile=FALSE) {
+	pdStudyData <- getOracleData("HM_DM_WRK_OWNER.V_W_PD_IN_CLINICAL_STUDY", saveToFile)
+	return (pdStudyData)
+}
+	
+getSAEStudyData <- function(saveToFile=FALSE) {
+	saeStudyData <- getOracleData("HM_DM_WRK_OWNER.V_W_SAE_IN_CLINICAL_STUDY", saveToFile)
+	return (saeStudyData)
+}
+
+getSafetyStudyData <- function(saveToFile=FALSE) {
+	safetyStudyData <- getOracleData("HM_DM_WRK_OWNER.V_W_SAE_IN_CLINICAL_STUDY", saveToFile)
+        return (safetyStudyData)	 
+}
+	
+getRTStudyData <- function(saveToFile=FALSE) {
+	rtStudyData <- getOracleData("HM_DM_WRK_OWNER.V_W_RT_IN_CLINICAL_STUDY", saveToFile)
+	return (rtStudyData)
+}
+	
+getTLStudyData <- function(saveToFile=FALSE) {
+	tlStudyData <- getOracleData("HM_DM_WRK_OWNER.V_W_TL_IN_CLINICAL_STUDY", saveToFile)
+	return (tlStudyData)
+}
+
+getMIStudyData <- function(saveToFile=FALSE) {
+        miStudyData <- getOracleData("HM_DM_WRK_OWNER.V_W_MI_IN_CLINICAL_STUDY", saveToFile)
+        return (miStudyData)
+}
+
+getAllStudyData <- function(saveToFile=FALSE) {
+	allStudyData <- getOracleData("HM_DM_WRK_OWNER.WRK_GL_IN_CLINICAL_STUDY", saveToFile)
+	return (allStudyData)
+}
+
+############
+# SITE DATA
+############
+
+getPDSiteData <- function(saveToFile=FALSE) {
+	pdSiteData <- getOracleData("HM_DM_WRK_OWNER.V_W_PD_IN_CLINICAL_STUDY_SITE", saveToFile)
+	return (pdSiteData)
+}
+	
+getSAESiteData <- function(saveToFile=FALSE) {
+	saeSiteData <- getOracleData("HM_DM_WRK_OWNER.V_W_SAE_IN_CLINICAL_STUDY_SITE", saveToFile)
+	return (saeSiteData)
+}
+	
+getSafetySiteData <- function(saveToFile=FALSE) {
+        safetySiteData <- getOracleData("HM_DM_WRK_OWNER.V_W_SAE_IN_CLINICAL_STUDY_SITE", saveToFile)
+        return (safetySiteData)
+}
+
+getRTSiteData <- function(saveToFile=FALSE) {
+	rtSiteData <- getOracleData("HM_DM_WRK_OWNER.V_W_RT_IN_CLINICAL_STUDY_SITE", saveToFile)
+	return (rtSiteData)
+}
+	
+getTLSiteData <- function(saveToFile=FALSE) {
+	tlSiteData <- getOracleData("HM_DM_WRK_OWNER.V_W_TL_IN_CLINICAL_STUDY_SITE", saveToFile)
+	return (tlSiteData)
+}
+	
+getMISiteData <- function(saveToFile=FALSE) {
+        miSiteData <- getOracleData("HM_DM_WRK_OWNER.V_W_MI_IN_CLINICAL_STUDY_SITE", saveToFile)
+        return (miSiteData)
+}
+
+getAllSiteData <- function(saveToFile=FALSE) {
+	allSiteData <- getOracleData("HM_DM_WRK_OWNER.WRK_GL_IN_CLINICAL_STUDY_SITE", saveToFile)
+	return (allSiteData)
+}
+
+###############
+# SUBJECT DATA
+###############
+
+getPDSubjectData <- function(saveToFile=FALSE) {
+	pdSubjectData <- getOracleData("HM_DM_WRK_OWNER.V_W_PD_IN_SUBJECT", saveToFile)
+	return (pdSubjectData)
+}
+	
+getSAESubjectData <- function(saveToFile=FALSE) {
+	saeSubjectData <- getOracleData("HM_DM_WRK_OWNER.V_W_SAE_IN_SUBJECT", saveToFile)
+	return (saeSubjectData)
+}
+
+getSafetySubjectData <- function(saveToFile=FALSE) {
+        safetySubjectData <- getOracleData("HM_DM_WRK_OWNER.V_W_SAE_IN_SUBJECT", saveToFile)
+        return (safetySubjectData)
+}
+
+getRTSubjectData <- function(saveToFile=FALSE) {
+	rtSubjectData <- getOracleData("HM_DM_WRK_OWNER.V_W_RT_IN_SUBJECT", saveToFile)
+	return (rtSubjectData)
+}
+
+getMISubjectData <- function(saveToFile=FALSE) {
+        miSubjectData <- getOracleData("HM_DM_WRK_OWNER.V_W_MI_IN_SUBJECT", saveToFile)
+        return (miSubjectData)
+}
+
+	
+getAllSubjectData <- function(saveToFile=FALSE) {
+	allSubjectData <- getOracleData("HM_DM_WRK_OWNER.WRK_GL_IN_SUBJECT", saveToFile)
+	return (allSubjectData)
+}
+
+##########
+# RAW DATA
+##########
+
+getRawTableData <- function(tableName, saveToFile=TRUE) {
+	rawTableData <- getOracleData(tableName, saveToFile)
+	return (rawTableData)
+}
+
+
+#########################
+# Unit Tests
+######################### 
+#getSafetyStudyData(TRUE)
+#getAEData(TRUE) 

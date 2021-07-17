@@ -1,0 +1,35 @@
+K 25
+svn:wc:ra_dav:version-url
+V 50
+/svn/repos/hm/!svn/ver/539/trunk/hm/src/engine/sql
+END
+fail_job.sql
+K 25
+svn:wc:ra_dav:version-url
+V 63
+/svn/repos/hm/!svn/ver/539/trunk/hm/src/engine/sql/fail_job.sql
+END
+check_job_not_running.sql
+K 25
+svn:wc:ra_dav:version-url
+V 76
+/svn/repos/hm/!svn/ver/539/trunk/hm/src/engine/sql/check_job_not_running.sql
+END
+start_job.sql
+K 25
+svn:wc:ra_dav:version-url
+V 64
+/svn/repos/hm/!svn/ver/539/trunk/hm/src/engine/sql/start_job.sql
+END
+truncate_wrk_out.sql
+K 25
+svn:wc:ra_dav:version-url
+V 71
+/svn/repos/hm/!svn/ver/539/trunk/hm/src/engine/sql/truncate_wrk_out.sql
+END
+end_job.sql
+K 25
+svn:wc:ra_dav:version-url
+V 62
+/svn/repos/hm/!svn/ver/539/trunk/hm/src/engine/sql/end_job.sql
+END

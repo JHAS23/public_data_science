@@ -1,0 +1,3 @@
+Dear Recipient:
+
+SITE HEALTH QC FAILED at R call , Please find attached QC Log FILE

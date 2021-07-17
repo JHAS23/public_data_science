@@ -1,0 +1,1097 @@
+###############################################################################################################
+# THIS PROGRAM PERFORMS ALL TURNOVER MODULE RELATED TASKS: 
+# 1)READ IN AND MERGES APPROPRIATE DATA
+# 2)AGGREGATE DATA OVER ANALYTIC PERIOD
+# 3)FIT MODELS RELATING PSQRV ISSUE COUNTS TO TURNOVER AND STAFF RATIOS
+# 4)APPLY MODEL COEFFICIENTS TO ONGOING SITE SET
+#
+# File Version: 1.2
+# Last Modified: 2014-JUN-12
+################################################################################################################
+
+
+rm(list=ls())
+wrkDir <- Sys.getenv("R_TMP")
+setwd(wrkDir)
+
+#####################################
+# Input Data - HM_DM_WRK_AREA Views
+#
+# 1. V_W_RT_IN_CLINICAL_STUDY
+# 2. V_W_RT_IN_CLINICAL_STUDY_SITE
+# 3. V_W_RT_IN_SUBJECT
+# 4. V_W_RT_IN_SITE_PERS_TURNOVER
+# 5. V_W_RT_IN_OVERSIGHT_REPORTS
+# 6. V_W_RT_IN_OR_RISK_CAT_COUNTS
+#
+####################################
+
+source("/app/r/engine/SiteHealthLogger.R")
+source("/app/r/engine/RODBCDataFetch.R")
+
+logInfo("Reading in RT Data from the Data Mart WRK Area Views...")	
+	
+# Read in data from the WRK Area Views
+V_W_RT_IN_CLINICAL_STUDY <- getRTStudyData()
+V_W_RT_IN_CLINICAL_STUDY_SITE <- getRTSiteData()
+V_W_RT_IN_SUBJECT <- getRTSubjectData()
+V_W_RT_IN_SITE_PERS_TURNOVER <- getRTData()
+V_W_RT_IN_OVERSIGHT_REPORTS <- getRTOSData()
+V_W_RT_IN_OR_RISK_CAT_COUNTS <- getRTOSCounts()
+
+logInfo("Done reading in RT Data from the DM...")
+
+######################################
+	# Classify Date fields in site data
+	V_W_RT_IN_CLINICAL_STUDY_SITE$SITE_FSFV_DATE <- as.Date(V_W_RT_IN_CLINICAL_STUDY_SITE$SITE_FSFV_DATE)
+	V_W_RT_IN_CLINICAL_STUDY_SITE$SITE_FSFV_DATE_DERIVED <- as.Date(V_W_RT_IN_CLINICAL_STUDY_SITE$SITE_FSFV_DATE_DERIVED)
+	V_W_RT_IN_CLINICAL_STUDY_SITE$SITE_LSLV_DATE <- as.Date(V_W_RT_IN_CLINICAL_STUDY_SITE$SITE_LSLV_DATE)
+	V_W_RT_IN_CLINICAL_STUDY_SITE$SITE_LSLV_DATE_DERIVED <- as.Date(V_W_RT_IN_CLINICAL_STUDY_SITE$SITE_LSLV_DATE_DERIVED)
+	V_W_RT_IN_CLINICAL_STUDY_SITE$LAST_MVR_DATE <- as.Date(V_W_RT_IN_CLINICAL_STUDY_SITE$LAST_MVR_DATE)
+	
+	study_useCt <- nrow(V_W_RT_IN_CLINICAL_STUDY) #805
+	site_useCt1 <- nrow(V_W_RT_IN_CLINICAL_STUDY_SITE) #21,537
+	
+	logInfo("Studies available for use -> YN_EXCLUDED=N and YN_RT_EXCLUDED=N:", study_useCt)
+	logInfo("Sites available for use -> YN_EXCLUDED=N and YN_RT_EXCLUDED=N:", site_useCt1)
+
+#################################
+# CUSTOM COUNT FUNCTIONS 
+#################################
+
+	# Function to get counts of events when only one dates is given.
+	countsinperiod <- function(period,datevariable){
+		apply(period,1,function(f){sum((f[1] <= datevariable) & (datevariable <= f[2]),na.rm=T) })
+		}
+
+	# Function to get counts of participants (e.g. staff or patients) when given start and end dates, counted as 1
+	# if any participation in the period.  Inputs: 2 column matrix of start and end dates for a period
+	# and start and end dates for the participants.
+	countsinperiod2dates <- function(period,datevariables){
+		apply(period,1,function(f){sum(
+			((f[1] <= datevariables[,1]) & (datevariables[,1] <=f[2])) |
+			((f[1] <= datevariables[,2]) & (datevariables[,2]<=f[2])) |
+			((datevariables[,1]< f[1]) & (f[2] < datevariables[,2])),na.rm=T)})
+		}
+
+	# Function to get counts of participants (e.g. staff or patients) when given start and end dates, scaled
+	# by how much of the period they participated in.  Inputs: 2 column matrix of start and end dates for a period
+	# and start and end dates for the participants.
+	
+	countsinperiod2dates_scale <- function(period,datevariables){
+		apply(period,1,function(f){
+			periodlength <- as.numeric(f[2] - f[1])
+			temp=rep(NA,dim(datevariables)[1])
+
+			use.datevariables=datevariables
+			use.datevariables[,1]=ifelse(use.datevariables[,1]<f[1],f[1],use.datevariables[,1])
+			use.datevariables[,2]=ifelse(use.datevariables[,2]>f[2],f[2],use.datevariables[,2])
+
+			replace.these=which(!((f[2] < datevariables[,1]) | (datevariables[,2] < f[1])))
+			temp[replace.these]=as.numeric(use.datevariables[replace.these,2] - use.datevariables[replace.these,1])/periodlength
+
+			sum(temp,na.rm=T)})
+		}
+
+# DATA PREPROCESSING NEEDED FOR MODELING
+
+	#########################################################################################
+	# SUBJECT & SITE DATA, SUBSET TO IN-SCOPE SITES BASED ON INCLUSION/EXCLUSION CRITERIA
+	#########################################################################################
+
+	# Should not change results - already filtered out in the Views
+	site_use <<- V_W_RT_IN_CLINICAL_STUDY_SITE[which(V_W_RT_IN_CLINICAL_STUDY_SITE$YN_PD_EXCLUDED=="N"),]
+	dim(site_use) # 21,537
+
+	########################################
+	# OVERSIGHT/PSQRV DATA
+	########################################
+
+	# Merge site data onto oversight/PSQRV data
+	head(V_W_RT_IN_CLINICAL_STUDY_SITE)
+	oversight_use <- merge(V_W_RT_IN_OVERSIGHT_REPORTS,V_W_RT_IN_CLINICAL_STUDY_SITE, 
+					by=c("HM_SITE_ID","HM_STUDY_ID"), all.x=T)
+
+	oversight_useCt <- nrow(oversight_use) #17,906
+	logInfo("Number of Oversight reports from V_W_RT_IN_OVERSIGHT_REPORTS", oversight_useCt)
+	
+	# Define data variables in oversight/PSQRV data
+	oversight_use$REPORT_END_DATE <- as.Date(oversight_use$REPORT_END_DATE)
+	oversight_use$REPORT_START_DATE <- as.Date(oversight_use$REPORT_START_DATE)
+	oversight_use$SITE_FSFV_DATE <- as.Date(oversight_use$SITE_FSFV_DATE)
+	oversight_use$SITE_FSFV_DATE_DERIVED <- as.Date(oversight_use$SITE_FSFV_DATE_DERIVED)
+	oversight_use$SITE_LSLV_DATE <- as.Date(oversight_use$SITE_LSLV_DATE)
+	oversight_use$SITE_LSLV_DATE_DERIVED <- as.Date(oversight_use$SITE_LSLV_DATE_DERIVED)
+	
+	# DEFINE ANALYSIS PERIOD: ONE YEAR FROM MOST RECENT OVERSIGHT/PSQRV DATE (End_DT) UNLESS FSFV WAS MORE RECENT THAN 1 YEAR FROM THIS DATE, THEN USE FSFV
+	# Create Period Length Variable based on Oversight/PSQRV dates	
+	oversight_use$PERIOD_START_1yr <-apply(data.frame(x=as.Date(oversight_use$SITE_FSFV_DATE_DERIVED),y=as.Date(oversight_use$REPORT_END_DATE) -365),1,max,na.rm=T) ### Sys.Date() -365 # CHANGE TO DERIVED
+	oversight_use$PERIOD_LENGTH <- as.Date(oversight_use$REPORT_END_DATE) - as.Date(oversight_use$PERIOD_START_1yr)
+	
+	# Subsetting performed in sandbox, line not needed in implementation
+	#oversight_use$REPORT_TYPE[which(oversight_use$PERIOD_LENGTH<0 & c(1:dim(oversight_use)[1])%in%grep("SIV|SITE INITIATION VISIT|PRE-INITIATION|STUDY INITIATION",toupper(oversight_use$DataReviewed)))] <- "SIV"
+	
+	# Remove SIVs and COVs; leave in Targeted review, NA, and regular PSQRV types;
+	# Remove those that happened before FSFV
+	# Remove those that happened before we have timeliness data	
+	# NEW JUNE 9 2014 - Changed to incorporate only PSQRVs that are of PSQRV type (excluded Targeted and N/A) and On Site Visits (Ongoing)
+	oversight_use <-oversight_use [which(oversight_use$REPORT_TYPE %in% c("PSQRV","On Site Visit - Ongoing")),]
+	oversight_use <- oversight_use[which(oversight_use$PERIOD_LENGTH>0),]
+
+	oversight_useCt2 <- nrow(oversight_use) #9,365 with remote reviews 
+	logInfo("Number of Oversight reports after sub-setting by REPORT_TYPE and PERIOD_LENGTH", oversight_useCt2)
+
+	#Keep the most recent PSQRV per site
+	oversight_use=oversight_use[order(oversight_use$HM_SITE_ID, -1*as.numeric(as.Date(oversight_use$REPORT_END_DATE))),]
+	oversight_use=oversight_use[-which(duplicated(oversight_use$HM_SITE_ID)),]
+	dim(oversight_use) #7,605
+
+	# Get issues count by report, merge onto oversight/PSQRV report data 
+	RPT_ISSUES <- as.data.frame(tapply(V_W_RT_IN_OR_RISK_CAT_COUNTS$RISK_CATEGORY_COUNT[V_W_RT_IN_OR_RISK_CAT_COUNTS$RISK_CATEGORY!="TOTAL ISSUES"], 
+			V_W_RT_IN_OR_RISK_CAT_COUNTS$HM_GL_IN_OVERSIGHT_REPORTS_ID[V_W_RT_IN_OR_RISK_CAT_COUNTS$RISK_CATEGORY!="TOTAL ISSUES"], sum))
+
+	names(RPT_ISSUES) <- "ISSUES_COUNT"
+	RPT_ISSUES$HM_GL_IN_OVERSIGHT_REPORTS_ID <- row.names(RPT_ISSUES)
+
+	oversight_use.UNIQUE <- merge(oversight_use, RPT_ISSUES, by="HM_GL_IN_OVERSIGHT_REPORTS_ID", all.x=T)
+	
+	#---------------------------------------------------------------------------------------------------------------
+	# 2014-JUN-04: Fill in zero counts for Oversight Visits with zero issues.  PSQRV has a TOTAL_ISSUE category 
+	# in the WRK_GL_IN_OR_RISK_CAT_COUNTS table, Oversight reports do not.
+	#---------------------------------------------------------------------------------------------------------------
+	oversight_use.UNIQUE$ISSUES_COUNT[which(is.na(oversight_use.UNIQUE$ISSUES_COUNT) & oversight_use.UNIQUE$REPORT_TYPE%in%c("On Site Visit - Ongoing"))]=0
+
+	#Remove missing issue count records
+	oversight_use.UNIQUE=oversight_use.UNIQUE[!is.na(oversight_use.UNIQUE$ISSUES_COUNT),] 
+	dim(oversight_use.UNIQUE) #7,605
+	
+	#############################
+	#SUBJECT DATA
+	#############################
+
+	# Classify Dates fields in subject data
+	V_W_RT_IN_SUBJECT$SUBJ_COMPLETED_STUDY_DT <- as.Date(V_W_RT_IN_SUBJECT$SUBJ_COMPLETED_STUDY_DT)
+	V_W_RT_IN_SUBJECT$SUBJ_DISCONTINUED_DT <- as.Date(V_W_RT_IN_SUBJECT$SUBJ_DISCONTINUED_DT)
+	V_W_RT_IN_SUBJECT$SUBJ_ENROLLED_STUDY_DT <- as.Date(V_W_RT_IN_SUBJECT$SUBJ_ENROLLED_STUDY_DT)
+	V_W_RT_IN_SUBJECT$SUBJ_ENROLLED_STUDY_DT_DERIVED <- as.Date(V_W_RT_IN_SUBJECT$SUBJ_ENROLLED_STUDY_DT_DERIVED)
+	V_W_RT_IN_SUBJECT$SUBJ_STATUS <- as.character(V_W_RT_IN_SUBJECT$SUBJ_STATUS)
+
+	# 1) Remove a) screen fails
+	#		b) those without enrollment dates
+	#		c) those without HM study id matches
+
+	dim(V_W_RT_IN_SUBJECT)#317,961
+
+	subject_mashup2 <- V_W_RT_IN_SUBJECT[which( 
+				!is.na(V_W_RT_IN_SUBJECT$SUBJ_ENROLLED_STUDY_DT_DERIVED) & 
+				!is.na(V_W_RT_IN_SUBJECT$SUBJ_STATUS) & 
+				!(V_W_RT_IN_SUBJECT$SUBJ_STATUS=="SCREEN FAIL") & 
+				!is.na(V_W_RT_IN_SUBJECT$HM_SITE_ID)),]
+
+	subjectCt <- nrow(V_W_RT_IN_SUBJECT)#317,961
+    logInfo("Subject data count before sub-setting: removing Screen Failures and records missing Enrollment Dates, etc:", subjectCt)
+	
+	dim(subject_mashup2) #213,467
+
+	subject_mashup3 <- merge(subject_mashup2,
+					  V_W_RT_IN_CLINICAL_STUDY_SITE[,c("HM_SITE_ID","SITE_STATUS",
+									"SITE_LSLV_DATE","SITE_LSLV_DATE_DERIVED")],by="HM_SITE_ID",all.x=T)
+	
+
+	# 2) Remove old/completed studies with all subject status "stuck" in SCREENED 
+	temp=table(subject_mashup3$HM_STUDY_ID,subject_mashup3$SUBJ_STATUS)
+	#head(temp)
+	# Not sure the removal of these studies is necessary 
+	all.screened.id=as.numeric(row.names(temp[which(apply(temp,1,sum,na.rm=T)==temp[,5]),]))
+	subject_mashup3=subject_mashup3[!(subject_mashup3$HM_STUDY_ID%in%all.screened.id),]
+
+
+	# 3) Create a modeling end date variable (used later in various aggregators - models)
+	#    If subject has completion date, use the completion date
+	#        else if subject has discontinuation date, use the discontinuation date
+	#            else if site is closed/terminated, use the LSLV date for the site (regardless of subject status... note: implication screen fails
+	#                                     not included (since removed) but does include all other statuses including SCREENED, ENROLLED/RANDOMIZED, etc.)
+	# 	NA value for this variables implies the subject is either on active treatment or in follow-up 
+	
+	subject_mashup3$MODELING_END_DT <- subject_mashup3$SUBJ_COMPLETED_STUDY_DT
+	subject_mashup3$MODELING_END_DT <- ifelse(is.na(subject_mashup3$MODELING_END_DT), subject_mashup3$SUBJ_DISCONTINUED_DT,subject_mashup3$MODELING_END_DT)
+	subject_mashup3$MODELING_END_DT <- ifelse(is.na(subject_mashup3$MODELING_END_DT) & subject_mashup3$SITE_STATUS%in%c("COMPLETED","TERMINATED"), subject_mashup3$SITE_LSLV_DATE_DERIVED,subject_mashup3$MODELING_END_DT)
+	subject_mashup3$MODELING_END_DT <- as.Date(subject_mashup3$MODELING_END_DT,origin="1970-01-01")
+
+	# 4) Subject Status (NOT CURRENTLY RUN)
+	#    For purposes of comparing subject counts to control totals, keep Screened in separate category (for some studies, unusually high proportions
+	#        of subjects remain in the "SCREENED" status).  Imputing the same end data for all of them is likely not appropriate.
+	#    For purposes of modeling, in completed/terminated sites, change subject status to complete
+	#	note: already excluded sites with all screened patients 
+
+		# Might not be necessary to include
+		#sum(subject_mashup3$SITE_STATUS%in%c("Completed","Terminated") & !subject_mashup3$MERGE_SUBJECT_STATUS%in%c("COMPLETED","DISCONTINUED"), na.rm=T) #25,796; a large number of subjects have not been "close out"
+		#subject_mashup3$EXCLU_SUBSET_SUBJECT_STATUS <- ifelse(subject_mashup3$SITE_STATUS%in%c("Completed","Terminated"),"COMPLETED",subject_mashup3$MERGE_SUBJECT_STATUS)
+
+		# Created a modeling subject status
+		subject_mashup3$MODELING_SUBJECT_STATUS <- ifelse(subject_mashup3$SITE_STATUS%in%c("COMPLETED","TERMINATED"),"Completed",subject_mashup3$SUBJ_STATUS)
+		subject <- subject_mashup3
+		#dim(subject) #212,555
+
+		# Create indicator variable for subjects that are currently active
+		subject$SUBJECT_ACTIVE <- ((subject$SUBJ_ENROLLED_STUDY_DT<= Sys.Date()) & 
+							is.na(subject$MODELING_END_DT))
+
+		# Subset subject data to sites meeting algorithm criteria
+		subject_use <<- subject[which(subject$HM_SITE_ID %in%c(site_use$HM_SITE_ID)) ,]
+		
+		# NEW JUNE 9 2014 - Commented out the rm statement below - unneeded
+		#rm(V_W_RT_IN_SUBJECT)
+		
+		subjectCt2 <- nrow(subject_use) # 212,555
+		logInfo("Subject data count after sub-setting to sites under analysis", subjectCt2)
+
+	#####################################################################################
+	# TURNOVER EVENT AGGREGATION
+
+	# Classify Date fields in role data
+
+	V_W_RT_IN_SITE_PERS_TURNOVER$STATUS_DATE <- as.Date(V_W_RT_IN_SITE_PERS_TURNOVER$STATUS_DATE)
+
+	roles <- V_W_RT_IN_SITE_PERS_TURNOVER[which(V_W_RT_IN_SITE_PERS_TURNOVER$HM_SITE_ID%in%site_use$HM_SITE_ID),]
+	#dim(roles) #575,753
+	
+	# NEW JUNE 9 2014 - Commented out the rm statement below - unneeded
+	#rm(V_W_RT_IN_SITE_PERS_TURNOVER)
+
+	#length(unique(roles$HM_SITE_ID)) # 21,537
+
+	#  DEDUP AND DROP TWO UNNECESSARY COLUMNS FROM SITE ROLE DATA
+
+	#table(roles$YN_EXCLUDED)
+	roles.unique <- unique(roles[,-which(names(roles)%in%c("YN_EXCLUDED",
+							"HM_SITE_PERSONNEL_TURNOVER_ID","EXCLUDED_REASON"))])
+
+	# DEDUP AGAIN
+	roles.unique <- unique(roles.unique)
+	#roles.unique$CONTACT_ROLE2 <- ifelse(roles.unique$CONTACT_ROLE_DERIVED%in%c("PRINCIPAL INVESTIGATOR","SUB INVESTIGATOR","CO-ORDINATOR","MONITOR"),as.character(roles.unique$CONTACT_ROLE_DERIVED),"OTHER")
+	roles.unique$CONTACT_ROLE_DERIVED <- factor(roles.unique$CONTACT_ROLE_DERIVED )
+
+	dim(roles.unique) #562,413
+
+
+	#####################################################################################
+	# FUNCTION THAT CALCULATES TURNOVER BY ROLE
+
+	turnover <- function(role, remove.days=1, as.of.date=Sys.Date(), historical=T){
+
+	## "historical=T" implies that as.of.date will not be used as this is for fitting the model 
+	## when applying the model coefficients, the "historical=F" should be selected as then as.of.date will be used for modeling period end 
+
+	###################################
+	# These commented out values were used in testing
+	# role="SUB INVESTIGATOR"
+	# as.of.date=Sys.Date() 
+	# historical=F
+
+	logInfo("Processing role: ", role)
+	selectedroles <- roles.unique[roles.unique$CONTACT_ROLE_DERIVED==role,-which(names(roles.unique)=="CONTACT_ROLE")]
+		
+	################################### ROLE DATA CLEANUP BEFORE COUNTING #########################################
+
+	# Re-order the records by Site ID, CCTR Person ID, and Status Date and merge on LSLV Date from Master Site Info 
+	
+	selectedroles=merge(selectedroles,V_W_RT_IN_CLINICAL_STUDY_SITE[,c("HM_SITE_ID","SITE_FSFV_DATE_DERIVED","SITE_LSLV_DATE_DERIVED")], by="HM_SITE_ID", all.x=T)
+	selectedroles$UNIQUE.ID=paste(selectedroles$HM_SITE_ID,selectedroles$HM_PERSON_ID)
+	
+	# NEW JUNE 9 2014 - Ordering Changed from -as.numeric(selectedroles$CONTACT_STATUS) to as.numeric(selectedroles$CONTACT_STATUS)
+	# Without the negative sign 
+	selectedroles <- selectedroles[order(selectedroles$UNIQUE.ID,selectedroles$STATUS_DATE, 
+						as.numeric(selectedroles$CONTACT_STATUS)),]
+
+	orig.selectedroles=selectedroles
+
+	#Test Cases can be reviewed if needed
+	#selectedroles[which(paste(selectedroles$HM_SITE_ID,selectedroles$HM_PERSON_ID)=="150005 491834"),]
+
+	# Case 1
+	# NEW JUNE 10 2014 - In New Data HM_PERSON_ID is sometimes missing - this needs to be accounted for 
+	# Remove records with missing STATUS DATES & HM_PERSON_ID
+ 
+        # 2016-MAR-28: Commented out due to fix in Oracle View to prevent missing STATUS_DATE or HM_PERSON_ID  
+        #selectedroles=selectedroles[-which(is.na(selectedroles$STATUS_DATE) | is.na(selectedroles$HM_PERSON_ID)),]
+  
+	
+	# Define Modeling Dates 
+	# historical=T or historical=F determines which dates are used 
+
+	if (historical)	
+	{
+		selectedroles=selectedroles[which(selectedroles$HM_SITE_ID%in%oversight_use.UNIQUE$HM_SITE_ID),]
+		selectedroles=merge(selectedroles,oversight_use.UNIQUE[,c("HM_SITE_ID","PERIOD_START_1yr","PERIOD_LENGTH")],
+								by="HM_SITE_ID", all.x=T)
+		names(selectedroles)[names(selectedroles)%in%c("PERIOD_START_1yr")]=c("MODELING.DATE.START")
+		selectedroles$MODELING.DATE.END=as.Date(selectedroles$MODELING.DATE.START)+as.numeric(selectedroles$PERIOD_LENGTH)
+		
+	} else   #for historical=F
+	{
+
+	selectedroles$SITE_LSLV_DATE_DERIVED=as.Date(selectedroles$SITE_LSLV_DATE_DERIVED)
+	selectedroles$MODELING.DATE.END=as.Date(ifelse(is.na(selectedroles$SITE_LSLV_DATE_DERIVED) | selectedroles$SITE_LSLV_DATE_DERIVED>as.of.date, 
+			as.character(as.of.date),
+			as.character(selectedroles$SITE_LSLV_DATE_DERIVED)))
+	selectedroles$MODELING.DATE.START=as.Date(ifelse((selectedroles$MODELING.DATE.END-365)<selectedroles$SITE_FSFV_DATE_DERIVED,
+						as.character(selectedroles$SITE_FSFV_DATE_DERIVED),as.character(selectedroles$MODELING.DATE.END-365)))
+	
+	#selectedroles[which(paste(selectedroles$HM_SITE_ID,selectedroles$HM_PERSON_ID)=="127794 448223"),]
+	#selectedroles[which(paste(selectedroles$HM_SITE_ID,selectedroles$HM_PERSON_ID)=="150005 491834"),]
+	# selectedroles[which(selectedroles$HM_SITE_ID==134631),]
+
+	}
+
+	# Case 2
+	# Remove records that are after the MODELING.DATE.END date 
+
+	temp.id=which(as.Date(selectedroles$MODELING.DATE.END)<as.Date(selectedroles$STATUS_DATE))
+	#length(temp.id) # 17,446 records removed
+	selectedroles=selectedroles[-temp.id,]
+    
+	#selectedroles[which(paste(selectedroles$HM_SITE_ID,selectedroles$HM_PERSON_ID)=="127794 189126"),]
+	#selectedroles[which(paste(selectedroles$HM_SITE_ID,selectedroles$HM_PERSON_ID)=="150005 491834"),]
+
+	# Case 4
+	# JUNE 9 2014 - Change from Active to Inactive (used to be inactive to active) to reflect new ordering 
+	# Note: Case 4 was moved up due to a substantial number of records having such instances and Rule 3a preventing
+	# these instances from being fixed 
+	### Remove records that that switch from inactive to active within "remove.days" 
+	### remove.days=1
+	
+	#selectedroles[which(selectedroles$HM_PERSON_ID==233855),]
+	#selectedroles[which(selectedroles$UNIQUE.ID=="229451 738129"),]
+	#selectedroles[which(selectedroles$HM_SITE_ID==130039),]
+	
+	n=dim(selectedroles)[1]
+		
+	selectedroles$REMOVE <- "KEEP"
+	selectedroles$Days.Inactive=NA
+		
+	selectedroles$REMOVE[1:(n-1)][selectedroles$UNIQUE.ID[1:(n-1)]==selectedroles$UNIQUE.ID[2:n] & 
+						difftime(selectedroles$STATUS_DATE[2:n], selectedroles$STATUS_DATE[1:(n-1)],unit="days")<=remove.days & 
+					selectedroles$CONTACT_STATUS[1:(n-1)]=="ACTIVE" & selectedroles$CONTACT_STATUS[2:n]=="INACTIVE"]= paste("REMOVE <=",remove.days,"DAYS")
+	
+	selectedroles$REMOVE[2:n][selectedroles$UNIQUE.ID[1:(n-1)]==selectedroles$UNIQUE.ID[2:n] &
+					difftime(selectedroles$STATUS_DATE[2:n],selectedroles$STATUS_DATE[1:(n-1)],unit="days")<=remove.days & 
+						selectedroles$CONTACT_STATUS[1:(n-1)]=="ACTIVE" & selectedroles$CONTACT_STATUS[2:n]=="INACTIVE"]= paste("REMOVE <=",remove.days,"DAYS")
+
+	selectedroles=selectedroles[selectedroles$REMOVE=="KEEP",]
+
+	# table(selectedroles$REMOVE) # 3,380 such records 
+
+	# Case 3.A
+	### Remove records that are ACTIVE ACTIVE (+ACTIVE...) by keeping the "oldest" ACTIVE ONLY 
+	# This is OK as only the minimum ACTIVE date will be retained per person in subsequent analyses
+	
+	n=dim(selectedroles)[1]
+	temp.id=which(selectedroles$UNIQUE.ID[1:(n-1)]==selectedroles$UNIQUE.ID[2:n] 
+				& selectedroles$CONTACT_STATUS[1:(n-1)]=="ACTIVE" & selectedroles$CONTACT_STATUS[2:n]=="ACTIVE")+1
+	
+	length(temp.id) #13 such records removed 
+	if (length(temp.id)>0) {selectedroles=selectedroles[-temp.id,]}
+
+	# NEW JUNE 9, 2014 - Added a new rule to clean multiple inactivities in a row
+	# Case 3.B
+	### Remove records that are INACTIVE INACTIVE (+INACTIVE ...) by keeping the "most recent" INACTIVE ONLY 
+
+	n=dim(selectedroles)[1]
+	temp.id=which(selectedroles$UNIQUE.ID[1:(n-1)]==selectedroles$UNIQUE.ID[2:n] 
+				& selectedroles$CONTACT_STATUS[1:(n-1)]=="INACTIVE" & selectedroles$CONTACT_STATUS[2:n]=="INACTIVE")+1
+	
+	length(temp.id) #8 such records removed 
+	if (length(temp.id)>0) {selectedroles=selectedroles[-temp.id,]}
+
+	# selectedroles[which(selectedroles$HM_SITE_ID==158153),]
+	### Note: n keeps changing after each removal of records (expected and OK)
+
+	n=dim(selectedroles)[1]
+	row.names(selectedroles)=1:n 
+
+	### ID RECORDS BEFORE MODELING PERIOD
+
+	temp.id=which(as.Date(selectedroles$MODELING.DATE.START)>as.Date(selectedroles$STATUS_DATE))
+	selectedroles$REMOVE[temp.id]="STATUS BEFORE MODELING START DATE"
+
+	#selectedroles[which(paste(selectedroles$HM_SITE_ID,selectedroles$HM_PERSON_ID)=="150005 448223"),]
+	#selectedroles[which(paste(selectedroles$HM_SITE_ID,selectedroles$HM_PERSON_ID)=="150005 491834"),]
+	# selectedroles[which(selectedroles$HM_SITE_ID==158153),]
+	
+	# table(selectedroles$REMOVE) # 69,211 such records; not all of them should be removed
+	
+	# Case 5
+	### "KEEP" Records that have 1)STATUS="ACTIVE" & 2)REMOVE="STATUS BEFORE MODELING START DATE" 
+	### are followed by STATUS="INACTIVE" and REMOVE="KEEP"
+
+	temp.id=which(selectedroles$UNIQUE.ID[1:(n-1)]==selectedroles$UNIQUE.ID[2:n] 
+				& selectedroles$CONTACT_STATUS[1:(n-1)]=="ACTIVE" & selectedroles$CONTACT_STATUS[2:n]=="INACTIVE" 
+				& selectedroles$REMOVE[1:(n-1)]=="STATUS BEFORE MODELING START DATE" & selectedroles$REMOVE[2:n]=="KEEP")
+
+	# length(temp.id) # 6,061 records will be change to "KEEP" below
+	selectedroles$REMOVE[temp.id]="KEEP"
+
+	#selectedroles[which(paste(selectedroles$HM_SITE_ID,selectedroles$HM_PERSON_ID)=="150005 448223"),]
+	#selectedroles[which(paste(selectedroles$HM_SITE_ID,selectedroles$HM_PERSON_ID)=="127794 189126"),]
+
+	# table(selectedroles$REMOVE) # 24,121 "KEEP" records
+
+	# Case 6
+	### "KEEP" Records that have 1)STATUS="ACTIVE" & 2)REMOVE="STATUS BEFORE MODELING START DATE" but they are the ONLY record for site
+
+	singletons=names(table(selectedroles$UNIQUE.ID)[which(table(selectedroles$UNIQUE.ID)==1)])
+
+	temp.id=which(selectedroles$UNIQUE.ID%in%singletons & selectedroles$CONTACT_STATUS=="ACTIVE" & 
+				selectedroles$REMOVE=="STATUS BEFORE MODELING START DATE")
+
+		# length(temp.id) # 6,061 records will be change to "KEEP" below
+	selectedroles$REMOVE[temp.id]="KEEP"
+
+	# Case 7
+	#### "KEEP" Records that have 1)STATUS="ACTIVE" & 2) REMOVE="STATUS BEFORE MODELING START DATE" but they are not followed by any other status
+	
+	temp.id=which(selectedroles$UNIQUE.ID[1:(n-1)]!=selectedroles$UNIQUE.ID[2:n] 
+				& selectedroles$CONTACT_STATUS[1:(n-1)]=="ACTIVE" 
+				& selectedroles$REMOVE[1:(n-1)]=="STATUS BEFORE MODELING START DATE")
+
+	selectedroles$REMOVE[temp.id]="KEEP"
+	
+	# length(temp.id)	 #35,005 records will be change to "KEEP"
+
+	selectedroles$REMOVE[temp.id]="KEEP"
+
+	#selectedroles[which(paste(selectedroles$HM_SITE_ID,selectedroles$HM_PERSON_ID)=="150005 448223"),]
+
+	# table(selectedroles$REMOVE) # 59,126 "KEEP" records
+
+	# Case 8
+	### ACTIVE TO INACTIVE TO ACTIVE ID; remove "INACTIVE" records between "ACTIVE" records within the modeling period 
+
+	temp.id=which(selectedroles$UNIQUE.ID[1:(n-2)]==selectedroles$UNIQUE.ID[2:(n-1)] & 
+						 selectedroles$UNIQUE.ID[2:(n-1)]==selectedroles$UNIQUE.ID[3:n] & 
+						selectedroles$CONTACT_STATUS[1:(n-2)]=="ACTIVE" & selectedroles$CONTACT_STATUS[2:(n-1)]=="INACTIVE"
+						& selectedroles$CONTACT_STATUS[3:(n)]=="ACTIVE")
+
+	selectedroles$REMOVE[2:(n-1)][temp.id]="REMOVE INACTIVES BETWEEN ACTIVES"
+	
+	selectedroles$Days.Inactive[2:(n-1)][temp.id] =
+						difftime(selectedroles$STATUS_DATE[3:(n)][temp.id], selectedroles$STATUS_DATE[2:(n-1)][temp.id],unit="days")
+	
+	#summary(selectedroles$Days.Inactive)/365 
+	#sum(!is.na(selectedroles$Days.Inactive))
+
+	#selectedroles[which(paste(selectedroles$HM_SITE_ID,selectedroles$HM_PERSON_ID)=="150005 448223"),]
+ 
+	### table(selectedroles$REMOVE) # 2,830 "INACTIVE" records will get removed 
+
+	selectedroles2 <- selectedroles[which(selectedroles$REMOVE=="KEEP"),]
+	selectedroles2$REMOVE <- NULL
+
+	#selectedroles2[which(paste(selectedroles2$HM_SITE_ID,selectedroles$HM_PERSON_ID)=="150005 448223"),]
+	#selectedroles2[which(paste(selectedroles2$HM_SITE_ID,selectedroles$HM_PERSON_ID)=="127794 189126"),]
+	# selectedroles2[which(selectedroles2$HM_SITE_ID==158153),]
+
+	# TEST CASES; THESE LINES CAN BE REMOVED FROM LIVE ENVIRONMENT CODE
+	#orig.selectedroles[which(orig.selectedroles$UNIQUE.ID=="229451 738129"),]
+	#selectedroles2[which(selectedroles2$UNIQUE.ID=="229451 738129"),]
+
+	#orig.selectedroles[which(orig.selectedroles$UNIQUE.ID=="31151 584181"),]
+	#selectedroles2[which(selectedroles2$UNIQUE.ID=="31151 584181"),]
+	
+	#orig.selectedroles[which(orig.selectedroles$UNIQUE.ID=="65777 412238"),]
+	#selectedroles2[which(selectedroles2$UNIQUE.ID=="65777 412238"),]
+
+	#orig.selectedroles[which(orig.selectedroles$UNIQUE.ID=="86354 429570"),]
+	#selectedroles2[which(selectedroles2$UNIQUE.ID=="86354 429570"),]
+	
+	#orig.selectedroles[which(orig.selectedroles$UNIQUE.ID=="71451 568190"),]
+	#selectedroles2[which(selectedroles2$UNIQUE.ID=="71451 568190"),]
+
+	################################### ID EARLIEST ACTIVITY DATE BY PERSON 
+	# BY PERSON 
+	selectedroles_active <- selectedroles2[which(selectedroles2$CONTACT_STATUS=="ACTIVE"),]
+
+	selectedroles_person_active <- aggregate(selectedroles_active$STATUS_DATE,
+			by=list(HM_SITE_ID=selectedroles_active$HM_SITE_ID,
+					HM_PERSON_ID=selectedroles_active$HM_PERSON_ID),min)
+	names(selectedroles_person_active)[3] <- "SITE_START"
+
+	selectedroles_inactive <- selectedroles2[which(selectedroles2$CONTACT_STATUS=="INACTIVE"),]
+	selectedroles_person_inactive <- aggregate(selectedroles_inactive$STATUS_DATE,
+			by=list(HM_SITE_ID=selectedroles_inactive$HM_SITE_ID, 
+				HM_PERSON_ID=selectedroles_inactive$HM_PERSON_ID),max)
+	names(selectedroles_person_inactive)[3] <- "SITE_END" 
+
+	selectedroles_person <- merge(selectedroles_person_active,selectedroles_person_inactive,by=c("HM_SITE_ID","HM_PERSON_ID"),all=T)
+	selectedroles_person <- selectedroles_person[order(selectedroles_person$HM_SITE_ID,
+		ifelse(is.na(selectedroles_person$SITE_START),selectedroles_person$SITE_END,selectedroles_person$SITE_START)),]
+
+	###################################
+	# No start or end date => put in the other start/end and include an indicator
+	
+	selectedroles_person$MISSING <- "NONE"
+	selectedroles_person$MISSING[is.na(selectedroles_person$SITE_START)] <- "START"
+	selectedroles_person$SITE_START[is.na(selectedroles_person$SITE_START)] <- selectedroles_person$SITE_END[is.na(selectedroles_person$SITE_START)]
+	selectedroles_person$MISSING[is.na(selectedroles_person$SITE_END)] <- "END"
+	selectedroles_person$SITE_END[is.na(selectedroles_person$SITE_END)] <- selectedroles_person$SITE_START[is.na(selectedroles_person$SITE_END)]
+
+	return(list(orig=selectedroles2,byperson=selectedroles_person))
+
+} #end of turnover function 
+
+
+	###################################
+	# CALCULATE MONITOR TURNOVER 
+	# Historical = T is used when fitting the models using PSQRVs
+	# Historical = F is used when applying model results
+
+	monitor_list.HIST <- turnover("MONITOR", as.of.date=Sys.Date(), historical=T)
+	monitor.HIST <- monitor_list.HIST$orig
+	monitor_person.HIST <- monitor_list.HIST$byperson
+
+	monitor_list <- turnover("MONITOR", as.of.date=Sys.Date(), historical=F)
+	monitor <- monitor_list$orig
+	monitor_person <- monitor_list$byperson
+
+	#dim(monitor_person) # 53,797  
+	#dim(monitor_person.HIST) # 19,695
+
+	###################################
+	# CALCULATE INVESTIGATOR TURNOVER 
+
+	# NEW JUNE 9 2014 - Commented out Investigator data creation - taking up time - not used in models 
+
+	#investigator_list.HIST <- turnover("PRINCIPAL INVESTIGATOR", as.of.date=Sys.Date(), historical=T)
+	#investigator.HIST <- investigator_list.HIST$orig
+	#investigator_person.HIST <- investigator_list.HIST$byperson
+
+	#investigator_list <- turnover("PRINCIPAL INVESTIGATOR", as.of.date=Sys.Date(), historical=F)
+	#investigator <- investigator_list$orig
+	#investigator_person <- investigator_list$byperson
+
+	#dim(investigator_person) # ...
+	#dim(investigator_person.HIST) # ...
+
+	###################################
+	# CALCULATE SUBINVESTIGATOR TURNOVER 
+
+	subinvestigator_list.HIST <- turnover("SUB INVESTIGATOR", as.of.date=Sys.Date(), historical=T)
+	subinvestigator.HIST <- subinvestigator_list.HIST$orig
+	subinvestigator_person.HIST <- subinvestigator_list.HIST$byperson
+
+	subinvestigator_list <- turnover("SUB INVESTIGATOR", as.of.date=Sys.Date(), historical=F)
+	subinvestigator <- subinvestigator_list$orig
+	subinvestigator_person <- subinvestigator_list$byperson
+	
+	#dim(subinvestigator_person) # 80,755
+	#dim(subinvestigator_person.HIST) # 30,183
+
+	###################################
+	# CALCULATE CO-ORDINATOR TURNOVER; NOTE: COORDINATOR ROLES WERE REMOVED DUE TO LACK OF CLEAN MAPPING AND POOR PREDICTIVE POWER IN LATER ALGORITHMS
+
+	# NEW JUNE 9 2014 - Commented out Coordinator data creation - taking up time - not used in models 
+	#coordinator_list.HIST <- turnover("CO-ORDINATOR", as.of.date=Sys.Date(), historical=T)
+	#coordinator.HIST <- coordinator_list.HIST$orig
+	#coordinator_person.HIST <- coordinator_list.HIST$byperson
+
+	#coordinator_list <- turnover("CO-ORDINATOR", as.of.date=Sys.Date(), historical=F)
+	#coordinator <- coordinator_list$orig
+	#coordinator_person <- coordinator_list$byperson
+
+	#dim(coordinator_person) # ...
+	#dim(coordinator_person.HIST) # ...
+
+	###################################
+	# MERGE/STACK TURNOVER DATASETS
+
+	# NEW JUNE 9 2014 - Deleted Coordinator and Investigator role info from the dataset below  
+	staff_turnover_dates.HIST <- rbind(data.frame(subinvestigator_person.HIST,ROLE="SUB INVESTIGATOR"),
+					data.frame(monitor_person.HIST,ROLE="MONITOR"))
+	
+	staff_turnover_dates.HIST$SITE_START <- as.Date(staff_turnover_dates.HIST$SITE_START)
+	staff_turnover_dates.HIST$SITE_END <- as.Date(staff_turnover_dates.HIST$SITE_END)
+	
+	#dim(staff_turnover_dates.HIST) #  49,878
+	#save(staff_turnover_dates.HIST,file=paste(lib.outmodel,"Turnover Aggregator HIST Jun 11 2014.Rdata",sep="")) # for model fitting
+
+	# NEW JUNE 9 2014 - Deleted Coordinator and Investigator role info from the dataset below  
+	staff_turnover_dates <- rbind(data.frame(subinvestigator_person,ROLE="SUB INVESTIGATOR"),
+					data.frame(monitor_person,ROLE="MONITOR"))
+	staff_turnover_dates$SITE_START <- as.Date(staff_turnover_dates$SITE_START)
+	staff_turnover_dates$SITE_END <- as.Date(staff_turnover_dates$SITE_END)
+
+	#dim(staff_turnover_dates) #134,533
+	#save(staff_turnover_dates,file=paste(lib.outmodel,"Turnover Aggregator Jun 11 2014.Rdata",sep="")) # for model application 
+
+#################################### END OF DATA AGGREGATION ########################
+
+#####################################################################################
+# MERGE PSQRV DATA WITH TURNOVER DATA
+	
+	# INITIALIZE THE COUNTS TO 0, THEN COUNT NUMBER OF STAFF AND NUMBER OF TURNOVER AT SITE DURING ANALYSIS PERIOD
+	# USE PSQRV DATA THAT HAS ONLY MOST RECENT OVERSIGHT/PSQRV RECORD PER SITE
+ 
+	#NEW JUNE 9 2014 - Removed PI and Coordinator roles from Data Aggregations
+	oversight_use.UNIQUE[,c("SI_COUNT_1yr","MON_COUNT_1yr","SI_TURN_1yr","MON_TURN_1yr")] <- NA
+	
+	for(i in 1:(dim(oversight_use.UNIQUE)[1])){
+	
+		# i=1
+		staff_use=staff_turnover_dates.HIST[staff_turnover_dates.HIST$HM_SITE_ID==oversight_use.UNIQUE$HM_SITE_ID[i],]
+
+		turnover <- staff_use[staff_use$MISSING!="END" & (oversight_use.UNIQUE$PERIOD_START_1yr[i] <= staff_use$SITE_END) 
+									     & (staff_use$SITE_END  <=oversight_use.UNIQUE$REPORT_END_DATE[i]),]
+
+		staff_turnover_dates.HIST[staff_turnover_dates.HIST$HM_SITE_ID==127794,]
+
+		oversight_use.UNIQUE[i,c("SI_COUNT_1yr","MON_COUNT_1yr","SI_TURN_1yr","MON_TURN_1yr")] <- c(table(staff_use$ROLE),table(turnover$ROLE))
+	}
+
+	#dim(oversight_use.UNIQUE) # 7,605
+	#save(oversight_use.UNIQUE,file=paste(lib.outmodel,"Turnover and PSQRV Data HIST June 10.Rdata",sep=""))
+
+	#############################################################################################################
+	# SUBSET DATA
+
+	# NEW JUNE 9 2014 - Removed PI_Count Check 
+	# NEW JUNE 9 2014 - Inclusion Criterion now is that both SI and Monitor should be there 
+	# Retain only records that have at least at least one monitor and SI
+	oversight_turnover <- oversight_use.UNIQUE[!(oversight_use.UNIQUE$SI_COUNT_1yr==0 
+							& oversight_use.UNIQUE$MON_COUNT_1yr==0),]
+	#dim(oversight_turnover) #7,600
+
+
+	#############################################################################################################
+	# GET SUBJECT COUNTS DURING THE ANALYSIS PERIOD
+
+	# Initialize the matrix, then loop through each site.  
+	# Only execute this for sites where the period length is not missing and non-negative
+
+	oversight_turnover[,c("PAT_COUNT","PAT_COUNT_SCALE")] <- NA
+
+	for (i in oversight_turnover$HM_SITE_ID){
+
+		#i=oversight_turnover$HM_SITE_ID[1]
+		site_ <- site_use[which(site_use$HM_SITE_ID==i),]
+
+		# Taking out those that don't have an enrollment date... Screen fails, etc.	
+		subject_ <- subject_use[which(subject_use$HM_SITE_ID==i),]
+
+			# For end date, use today's date if others are not given.  Note: end dates already imputed for completed/terminated studies
+			subject_$MODELING_END_DT[which(is.na(subject_$MODELING_END_DT)& subject_$MODELING_SUBJECT_STATUS!="SCREEN FAIL")] <- Sys.Date()
+
+		# PATIENT ENROLLMENTS
+		# Count of number of patients ongoing at any point during the period
+		PERIOD_START <- oversight_turnover[oversight_turnover$HM_SITE_ID==i,"PERIOD_START_1yr"]
+		PERIOD_END <- oversight_turnover[oversight_turnover$HM_SITE_ID==i,"REPORT_END_DATE"]
+
+		oversight_turnover$PAT_COUNT[oversight_turnover$HM_SITE_ID==i] <- 
+				countsinperiod2dates( cbind(as.Date(PERIOD_START),as.Date(PERIOD_END)), 
+				cbind(subject_$SUBJ_ENROLLED_STUDY_DT_DERIVED,
+					subject_$MODELING_END_DT))
+
+		# Count of number of patients ongoing in the period scaled by how much of the period they were enrolled for
+		oversight_turnover$PAT_COUNT_SCALE[oversight_turnover$HM_SITE_ID==i] <- 
+				countsinperiod2dates_scale(cbind(as.Date(PERIOD_START),as.Date(PERIOD_END)),
+					cbind(subject_$SUBJ_ENROLLED_STUDY_DT_DERIVED,subject_$MODELING_END_DT))
+
+	}
+
+	# There are occurences with no currently enrolled patients at the point that the psqrv happens, or for the entire
+	# year previous.  Possibly happens in anticipation of an upcoming enrollment period
+
+	# Remove zero patient records
+	oversight_turnover <- oversight_turnover[!(oversight_turnover$PAT_COUNT_SCALE==0),]
+	#dim(oversight_turnover) # 5,164
+
+	# Remove PSQRVs with Missing PSQRV Issue Counts
+
+	oversight_turnover <- oversight_turnover[!is.na(oversight_turnover$ISSUES_COUNT),]
+	#dim(oversight_turnover) #5,164
+
+	oversight_turnover$ISSUES_COUNT.Capped <- ifelse(oversight_turnover$ISSUES_COUNT>
+				quantile(oversight_turnover$ISSUES_COUNT,.99),quantile(oversight_turnover$ISSUES_COUNT,.99),oversight_turnover$ISSUES_COUNT)
+
+	#table(oversight_turnover$ISSUES_COUNT.Capped) # Capped at 32
+
+	#Scaled Patient Count
+	# NEW JUNE 9 2014 - All Coordinator Variables have been commented out
+	oversight_turnover$SI_COUNT_1yr.Scaled <- oversight_turnover$SI_COUNT_1yr / oversight_turnover$PAT_COUNT
+	#oversight_turnover$COORD_COUNT_1yr.Scaled <- oversight_turnover$COORD_COUNT_1yr / oversight_turnover$PAT_COUNT
+	oversight_turnover$MON_COUNT_1yr.Scaled <- oversight_turnover$MON_COUNT_1yr / oversight_turnover$PAT_COUNT
+
+	oversight_turnover$SI_TURN_1yr_p <- ifelse(oversight_turnover$SI_COUNT_1yr==0,0,oversight_turnover$SI_TURN_1yr / oversight_turnover$SI_COUNT_1yr)
+	#oversight_turnover$COORD_TURN_1yr_p <- ifelse(oversight_turnover$COORD_COUNT_1yr==0,0,oversight_turnover$COORD_TURN_1yr / oversight_turnover$COORD_COUNT_1yr)
+	oversight_turnover$MON_TURN_1yr_p <- ifelse(oversight_turnover$MON_COUNT_1yr==0,0,oversight_turnover$MON_TURN_1yr / oversight_turnover$MON_COUNT_1yr)
+
+
+	oversight_turnover$SI_COUNT_1yr.Scaled.CAPPED=ifelse(oversight_turnover$SI_COUNT_1yr.Scaled>quantile(oversight_turnover$SI_COUNT_1yr.Scaled,.90, na.rm=T),
+							quantile(oversight_turnover$SI_COUNT_1yr.Scaled,.90, na.rm=T),oversight_turnover$SI_COUNT_1yr.Scaled)
+	#oversight_turnover$COORD_COUNT_1yr.Scaled.CAPPED=ifelse(oversight_turnover$COORD_COUNT_1yr.Scaled>quantile(oversight_turnover$COORD_COUNT_1yr.Scaled,.90, na.rm=T),
+	#						quantile(oversight_turnover$COORD_COUNT_1yr.Scaled,.90, na.rm=T),oversight_turnover$COORD_COUNT_1yr.Scaled)
+	oversight_turnover$MON_COUNT_1yr.Scaled.CAPPED=ifelse(oversight_turnover$MON_COUNT_1yr.Scaled>quantile(oversight_turnover$MON_COUNT_1yr.Scaled,.90, na.rm=T),
+							quantile(oversight_turnover$MON_COUNT_1yr.Scaled,.90, na.rm=T),oversight_turnover$MON_COUNT_1yr.Scaled)
+	row.names(oversight_turnover)=1:nrow(oversight_turnover)
+
+	#save(oversight_turnover,file=paste(lib.outmodel,"Turnover Model Data FINAL June 11 2014.Rdata",sep="")) # saved data for model fitting 
+
+	# NEW JUNE 9 2014 - the following plots do not need to be implemented on the R server 
+	####################### INSERTED RELATIONSHIP PLOTS ##########################
+	
+
+	#OV.id=which(oversight_turnover$REPORT_TYPE%in%c("On Site Visit - Ongoing") & oversight_turnover$MON_COUNT_1yr.Scaled.CAPPED>0 &
+	#											oversight_turnover$SI_COUNT_1yr.Scaled.CAPPED>0)
+	#PSQRV.id=which(oversight_turnover$REPORT_TYPE%in%c("PSQRV") & oversight_turnover$MON_COUNT_1yr.Scaled.CAPPED>0 &
+	#											oversight_turnover$SI_COUNT_1yr.Scaled.CAPPED>0)
+	
+	# MON TURN
+	#plot(jitter(oversight_turnover$MON_TURN_1yr_p),jitter(oversight_turnover$ISSUES_COUNT.Capped), pch=".", ylim=c(6,11), 
+	#	xlab="Monitor Turnover", ylab="Number of Issues")
+	#points(smooth.spline(oversight_turnover$MON_TURN_1yr_p[PSQRV.id],oversight_turnover$ISSUES_COUNT.Capped[PSQRV.id], spar=1), 
+	#			type="l", col="Red", lwd=2)
+	#points(smooth.spline(oversight_turnover$MON_TURN_1yr_p[OV.id],oversight_turnover$ISSUES_COUNT.Capped[OV.id], spar=1), 
+	#			type="l", col="Blue", lwd=2)
+
+	#legend(.1,9.5, col=c("Red", "Blue"), lty=c(1,1), 
+	#		legend=c("PSQRVs", "Oversight:OnSite"), bg="White", cex=.8)
+	
+
+	#SI TURN
+	#plot(jitter(oversight_turnover$SI_TURN_1yr_p),jitter(oversight_turnover$ISSUES_COUNT.Capped), pch=".", ylim=c(6,10), 
+	#xlab="SI Turnover", ylab="Number of Issues")
+	#points(smooth.spline(oversight_turnover$SI_TURN_1yr_p[PSQRV.id],oversight_turnover$ISSUES_COUNT.Capped[PSQRV.id], spar=1, tol=.01), 
+	#			type="l", col="Red", lwd=2)
+	#points(smooth.spline(oversight_turnover$SI_TURN_1yr_p[OV.id],oversight_turnover$ISSUES_COUNT.Capped[OV.id], spar=1, tol=.01), 
+	#			type="l", col="Blue", lwd=2)
+
+	#legend(.1,9.5, col=c("Red", "Blue"), lty=c(1,1), 
+	#		legend=c("PSQRVs", "Oversight:OnSite"), bg="White", cex=.8)
+
+	# MON TO PATIENT RATIO
+
+	#plot(jitter(oversight_turnover$MON_COUNT_1yr.Scaled.CAPPED),jitter(oversight_turnover$ISSUES_COUNT.Capped), pch=".", ylim=c(6,10), 
+	#	xlab="Monitor to Patient Ratio", ylab="Number of Issues")
+	#points(smooth.spline(oversight_turnover$MON_COUNT_1yr.Scaled.CAPPED[PSQRV.id],oversight_turnover$ISSUES_COUNT.Capped[PSQRV.id], spar=1.4), type="l", 
+	#				col="Red", lwd=2)
+	#	points(smooth.spline(oversight_turnover$MON_COUNT_1yr.Scaled.CAPPED[OV.id],oversight_turnover$ISSUES_COUNT.Capped[OV.id], spar=1.4), type="l", 
+	#				col="Blue", lwd=2)
+	
+	#legend(.1,9.5, col=c("Red", "Blue"), lty=c(1,1), 
+	#		legend=c("PSQRVs", "Oversight:OnSite"), bg="White", cex=.8)
+
+	# SI TO PATIENT RATIO
+
+	#plot(jitter(oversight_turnover$SI_COUNT_1yr.Scaled.CAPPED),jitter(oversight_turnover$ISSUES_COUNT.Capped), pch=".", 
+	#			ylim=c(4,10), xlab="SI to Patient Ratio", ylab="Number of Issues")
+	#points(smooth.spline(oversight_turnover$SI_COUNT_1yr.Scaled.CAPPED[PSQRV.id],oversight_turnover$ISSUES_COUNT.Capped[PSQRV.id], spar=1.5), type="l", 
+	#				col="Red", lwd=2)
+	#	points(smooth.spline(oversight_turnover$SI_COUNT_1yr.Scaled.CAPPED[OV.id],oversight_turnover$ISSUES_COUNT.Capped[OV.id], spar=1.5), type="l", 
+	#				col="Blue", lwd=2)
+
+	#legend(.1,9.5, col=c("Red", "Blue"), lty=c(1,1), 
+	#		legend=c("PSQRVs", "Oversight:OnSite"), bg="White", cex=.8)
+
+	#summary(oversight_turnover$SI_COUNT_1yr.Scaled.CAPPED)
+
+	### PERIOD LENGTH
+
+	#table(as.numeric(oversight_turnover$PERIOD_LENGTH))
+
+	#plot(jitter(as.numeric(oversight_turnover$PERIOD_LENGTH)), jitter(oversight_turnover$ISSUES_COUNT.Capped), pch=".", cex=.8, ylim=c(5,10),
+	#	xlab="Analysis Period Length (in Days)", ylab="Number of Capped Issues")
+	#points(smooth.spline(as.numeric(oversight_turnover$PERIOD_LENGTH[PSQRV.id]),oversight_turnover$ISSUES_COUNT.Capped[PSQRV.id], spar=1), 
+	#			col="Red", lwd=2, type="l")
+	#points(smooth.spline(as.numeric(oversight_turnover$PERIOD_LENGTH[OV.id]),oversight_turnover$ISSUES_COUNT.Capped[OV.id], spar=1.1), 
+	#			col="Blue", lwd=2, type="l")
+
+	#legend(.1,9.5, col=c("Red", "Blue"), lty=c(1,1), 
+	#		legend=c("PSQRVs", "Oversight:OnSite"), bg="White", cex=.8)
+
+
+	#plot(density(oversight_turnover$ISSUES_COUNT.Capped[OV.id]), type="l", col="Blue", lwd=2, main="Issue Count Distribution")
+	#points(density(oversight_turnover$ISSUES_COUNT.Capped[PSQRV.id]), type="l", col="Red", lwd=2, main="Issue Count Distribution")
+	#	legend(20,.06, col=c("Red", "Blue"), lty=c(1,1), 
+	#		legend=c("PSQRVs", "Oversight:OnSite"), bg="White", cex=.8)
+	
+	#ks.test(oversight_turnover$ISSUES_COUNT.Capped[OV.id],oversight_turnover$ISSUES_COUNT.Capped[PSQRV.id])
+
+	#############################################################################################################
+	# NEW JUNE 9, 2014 - Regression models were re-specified - only fitting one model now - and only for sites that
+	# have at least one monitori and Sub-I
+	# REGRESSION MODEL FOR RELATING STAFFING DYNAMICS TO PSQRV ISSUE COUNTS 
+
+	###	GLOBAL MODEL 
+	### Model for sites with non-zero MON & Sub-I Counts
+
+	fit.staff.SIandMONavailable.GLOBAL <- lm(ISSUES_COUNT.Capped ~ 	(PERIOD_LENGTH+I(as.numeric(PERIOD_LENGTH-120>0)*(PERIOD_LENGTH-120))+
+									+ I(as.numeric(SI_TURN_1yr_p-.4>0)*(SI_TURN_1yr_p-.4))+
+									+ log(SI_COUNT_1yr.Scaled.CAPPED + 1) 
+									+ MON_TURN_1yr_p
+									+ log(MON_COUNT_1yr.Scaled.CAPPED + 1)):REPORT_TYPE +REPORT_TYPE
+									, data=oversight_turnover[oversight_turnover$MON_COUNT_1yr.Scaled.CAPPED>0 & 
+												    oversight_turnover$SI_COUNT_1yr.Scaled.CAPPED>0 & 
+			(oversight_turnover$REPORT_TYPE%in%c("On Site Visit - Ongoing","PSQRV")),])
+	
+	summary(fit.staff.SIandMONavailable.GLOBAL )
+
+	###	FINAL MODEL 
+	### Model for sites with non-zero MON & Sub-I Counts
+
+	#### Monitor to Pt Ratios Left Out
+
+	row.names(oversight_turnover)=1:dim(oversight_turnover)[1]
+	fit.staff.SIandMONavailable.FINAL <- lm(ISSUES_COUNT.Capped ~ 	(PERIOD_LENGTH+I(as.numeric(PERIOD_LENGTH-120>0)*(PERIOD_LENGTH-120))+
+									+ I(as.numeric(SI_TURN_1yr_p-.4>0)*(SI_TURN_1yr_p-.4))+
+									+ log(SI_COUNT_1yr.Scaled.CAPPED + 1) 
+									+ MON_TURN_1yr_p) +REPORT_TYPE
+									, data=oversight_turnover[oversight_turnover$MON_COUNT_1yr.Scaled.CAPPED>0 & 
+												    oversight_turnover$SI_COUNT_1yr.Scaled.CAPPED>0 & 
+			(oversight_turnover$REPORT_TYPE%in%c("On Site Visit - Ongoing","PSQRV")),])
+	
+	summary(fit.staff.SIandMONavailable.FINAL )
+
+	### Turnover has two models: one for sites with at least one MON and one SI; and another model for sites with MON(s) but no SIs
+
+	oversight_turnover$fitted <- NA
+	oversight_turnover$fitted[as.numeric(names(fit.staff.SIandMONavailable.FINAL$fitted))]=fit.staff.SIandMONavailable.FINAL$fitted
+
+	#which(oversight_turnover$SI_COUNT_1yr.Scaled.CAPPED>0 & oversight_turnover$MON_COUNT_1yr.Scaled.CAPPED>0)-as.numeric(names(fit.staff.SIandMONavailable$fitted))
+	no.pred.ct=sum(is.na(oversight_turnover$fitted)) #301 sites do not have at least one monitor and SI
+
+	oversight_turnover=oversight_turnover[which(!is.na(oversight_turnover$fitted)),]
+
+	#dim(oversight_turnover) #4,863
+
+	oversight_turnover$fitted.P <- rank(oversight_turnover$fitted)/sum(!is.na(oversight_turnover$fitted))
+
+	#oversight_turnover <- oversight_turnover[,!(colnames(oversight_turnover) %in% c("COORD_COUNT_1yr","COORD_TURN_1yr","COORD_COUNT_1yr.Scaled","COORD_TURN_1yr_p"))]	
+	#save(fit.staff.SIandMONavailable.FINAL,oversight_turnover,file=paste(lib.outmodel,"Turnover Model Data and Model Outputs Algorithm June 12 2014 with Remote.Rdata",sep=""))
+
+	#############################################################################################################
+	# APPLYING THE MODEL TO ONGOING STUDY DATA 
+
+	# ID in-scope site 
+
+	# Create list of sites that used in visualization
+	studies_for_viz <- V_W_RT_IN_CLINICAL_STUDY[which(V_W_RT_IN_CLINICAL_STUDY$YN_VISUALIZE %in% c("Y")),]
+	site_use_viz <- V_W_RT_IN_CLINICAL_STUDY_SITE[which(V_W_RT_IN_CLINICAL_STUDY_SITE$HM_STUDY_ID %in% studies_for_viz$HM_STUDY_ID),]
+	
+	site_useCt2 <- nrow(site_use_viz) #6,838
+	logInfo("Site data count after sub-setting to those sites in scope for visualization: YN_VISUALIZED=Y:", site_useCt2)
+
+
+	####################################################################################
+	# GET METRICS NEEDED TO APPLY THE MODEL TO THE ONGOING SITE DATA 
+
+	ongoing_turnover <- site_use_viz
+
+	ongoing_turnover$End_DT  <- as.Date(apply(matrix(ongoing_turnover$SITE_LSLV_DATE_DERIVED,ncol=1),1,
+							function(f){min(f,Sys.Date(),na.rm=T)}),origin="1970-01-01" ) 
+
+	ongoing_turnover$PERIOD_START_1yr <- as.Date(ifelse(ongoing_turnover$SITE_FSFV_DATE_DERIVED > (ongoing_turnover$End_DT - 365),
+							ongoing_turnover$SITE_FSFV_DATE_DERIVED,(ongoing_turnover$End_DT - 365)),origin="1970-01-01")
+	ongoing_turnover$PERIOD_LENGTH <- ongoing_turnover$End_DT - ongoing_turnover$PERIOD_START_1yr
+
+	# Remove records with non-positive period length 
+	ongoing_turnover=ongoing_turnover[ongoing_turnover$PERIOD_LENGTH>0,]
+	#dim(ongoing_turnover) #6,779
+	
+	# NEW JUNE 9, 2014 - Modified to Exclude Coordinator and PI Counts and Turnover 
+	ongoing_turnover[,c("SI_COUNT_1yr","MON_COUNT_1yr", "SI_TURN_1yr","MON_TURN_1yr")] <- NA
+
+	diff.tracked=numeric(0)
+	for(i in 1:(dim(ongoing_turnover)[1])){
+		#i=10
+		staff_ <- staff_turnover_dates[staff_turnover_dates$HM_SITE_ID==ongoing_turnover$HM_SITE_ID[i],]
+
+		staff_use <- staff_[(staff_$MISSING=="END" & staff_$SITE_START < ongoing_turnover$PERIOD_START_1yr[i])|
+			((ongoing_turnover$PERIOD_START_1yr[i] <= staff_$SITE_START ) & (staff_$SITE_START  <=ongoing_turnover$End_DT[i])) |
+			((ongoing_turnover$PERIOD_START_1yr[i] <= staff_$SITE_END) & (staff_$SITE_END <=ongoing_turnover$End_DT[i])) |
+			((staff_$SITE_START < ongoing_turnover$PERIOD_START_1yr[i]) & (ongoing_turnover$End_DT[i] < staff_$SITE_END)),]
+		turnover <- staff_use[staff_use$MISSING!="END" & (ongoing_turnover$PERIOD_START_1yr[i] < staff_use$SITE_END) & (staff_use$SITE_END  <=ongoing_turnover$End_DT[i]),]
+		ongoing_turnover[i,c("SI_COUNT_1yr","MON_COUNT_1yr","SI_TURN_1yr","MON_TURN_1yr")] <- c(table(staff_use$ROLE),table(turnover$ROLE))
+		diff.tracked=rbind(diff.tracked,c(i, nrow(staff_), nrow(staff_use),nrow(staff_)- nrow(staff_use)))
+
+	}
+
+	#head(ongoing_turnover)
+
+	# ADDITION: SUBSET VISUALIZED SITES TO SITES THAT HAVE AT LEAST 1 ACTIVE MONITOR AND 1 ACTIVE SUB-I IN THE EVALUATION PERIOD
+	ongoing_turnover <- ongoing_turnover[ongoing_turnover$MON_COUNT_1yr > 0 & ongoing_turnover$SI_COUNT_1yr,]
+	#############################################################################################################
+	# GET SUBJECT COUNTS & TURNOVER COUNTS DURING THE EVALUATION PERIOD
+	
+	#dim(ongoing_turnover) #6,404
+
+	# Initialize the matrix, then loop through each site.  Only do this for sites where the period length is not missing (negative)
+	ongoing_turnover[,c("PAT_COUNT","PAT_COUNT_SCALE")] <- NA
+
+	for (i in ongoing_turnover$HM_SITE_ID){
+
+		#i=ongoing_turnover$HM_SITE_ID[1]
+		site_ <- site_use_viz[which(site_use_viz$HM_SITE_ID==i),]
+
+		# Taking out those that don't have an enrollment date... Screen fails, etc.	
+		subject_ <- subject_use[which(subject_use$HM_SITE_ID==i),]
+
+		# For end date, use today's date if others are not given.  Note: end dates already imputed for completed/terminated studies
+		subject_$MODELING_END_DT[which(is.na(subject_$MODELING_END_DT)& subject_$MODELING_SUBJECT_STATUS!="SCREEN FAIL")] <- Sys.Date()
+
+		# PATIENT ENROLLMENTS
+		# Count of number of patients ongoing at any point during the period
+		PERIOD_START <- ongoing_turnover[ongoing_turnover$HM_SITE_ID==i,"PERIOD_START_1yr"]
+		PERIOD_END <- ongoing_turnover[ongoing_turnover$HM_SITE_ID==i,"End_DT"]
+
+		ongoing_turnover$PAT_COUNT[ongoing_turnover$HM_SITE_ID==i] <- countsinperiod2dates( cbind(PERIOD_START,PERIOD_END), cbind(subject_$SUBJ_ENROLLED_STUDY_DT_DERIVED,subject_$MODELING_END_DT))
+
+		# Count of number of patients ongoing in the period scaled by how much of the period they were enrolled for
+		ongoing_turnover$PAT_COUNT_SCALE[ongoing_turnover$HM_SITE_ID==i] <- countsinperiod2dates_scale(cbind(PERIOD_START,PERIOD_END),cbind(subject_$SUBJ_ENROLLED_STUDY_DT_DERIVED,subject_$MODELING_END_DT))
+
+	} #end for loop
+
+	# Actively treated patients was determined using subject statuses; however there are a number of sites that do not
+	# have enrollment dates and therefore this algorithm is registering them as having 0 active subjects
+	# during the analysis timeframe.
+
+	#table(ongoing_turnover$PAT_COUNT) ### 2,394 sites with zero patient counts 
+
+	ongoing_turnover=ongoing_turnover[which(ongoing_turnover$PAT_COUNT>0),]
+	ongoing.site.count=nrow(ongoing_turnover) # Model coefficients can be applied to 4,010 sites 
+
+	logInfo("Staffing Dynamics Regression Model will be applied the following number of sites:", ongoing.site.count)	
+
+	#############################################################################################################
+	# CALCULATE ADDITIONAL METRICS NEEDED FOR MODEL APPLICATION
+	# NEW JUNE 9, 2014 - Modified to Exclude Coordinator Metrics
+
+	ongoing_turnover$SI_COUNT_1yr.Scaled <- ongoing_turnover$SI_COUNT_1yr / ongoing_turnover$PAT_COUNT
+	#ongoing_turnover$COORD_COUNT_1yr.Scaled <- ongoing_turnover$COORD_COUNT_1yr / ongoing_turnover$PAT_COUNT
+	ongoing_turnover$MON_COUNT_1yr.Scaled <- ongoing_turnover$MON_COUNT_1yr / ongoing_turnover$PAT_COUNT
+
+	ongoing_turnover$SI_TURN_1yr_p <- ifelse(ongoing_turnover$SI_COUNT_1yr==0,0,ongoing_turnover$SI_TURN_1yr / ongoing_turnover$SI_COUNT_1yr)
+	#ongoing_turnover$COORD_TURN_1yr_p <- ifelse(ongoing_turnover$COORD_COUNT_1yr==0,0,ongoing_turnover$COORD_TURN_1yr / ongoing_turnover$COORD_COUNT_1yr)
+	ongoing_turnover$MON_TURN_1yr_p <- ifelse(ongoing_turnover$MON_COUNT_1yr==0,0,ongoing_turnover$MON_TURN_1yr / ongoing_turnover$MON_COUNT_1yr)
+
+
+	ongoing_turnover$SI_COUNT_1yr.Scaled.CAPPED=ifelse(ongoing_turnover$SI_COUNT_1yr.Scaled>quantile(ongoing_turnover$SI_COUNT_1yr.Scaled,.95, na.rm=T),
+							quantile(ongoing_turnover$SI_COUNT_1yr.Scaled,.95, na.rm=T),ongoing_turnover$SI_COUNT_1yr.Scaled)
+	#ongoing_turnover$COORD_COUNT_1yr.Scaled.CAPPED=ifelse(ongoing_turnover$COORD_COUNT_1yr.Scaled>quantile(ongoing_turnover$COORD_COUNT_1yr.Scaled,.95, na.rm=T),
+	#						quantile(ongoing_turnover$COORD_COUNT_1yr.Scaled,.95, na.rm=T),ongoing_turnover$COORD_COUNT_1yr.Scaled)
+	ongoing_turnover$MON_COUNT_1yr.Scaled.CAPPED=ifelse(ongoing_turnover$MON_COUNT_1yr.Scaled>quantile(ongoing_turnover$MON_COUNT_1yr.Scaled,.95, na.rm=T),
+							quantile(ongoing_turnover$MON_COUNT_1yr.Scaled,.95, na.rm=T),ongoing_turnover$MON_COUNT_1yr.Scaled)
+
+
+	# EXCLUDE COORDINATOR VARIABLES 
+	#Removing variables related to the role of coordinator (counts, turnover, etc.). To include coordinator variables in output results, remove the single line of code below.
+	#ongoing_turnover <- ongoing_turnover[,!(colnames(ongoing_turnover) %in% c("COORD_COUNT_1yr","COORD_TURN_1yr","COORD_COUNT_1yr.Scaled","COORD_TURN_1yr_p"))]
+
+	#############################################################################################################
+	# APPLY MODEL COEFFICIENTS TO GET PREDICTIONS
+	# NEW JUNE 9, 2014 - There is a single model now only - model for SI Count = 0 was not retained
+
+	#id.fit.staff.noSI=which(ongoing_turnover$SI_COUNT_1yr.Scaled==0 & ongoing_turnover$MON_COUNT_1yr.Scaled>0)
+	#length(id.fit.staff.noSI) # 232 ongoing sites do not have an SI but have a monitor 
+
+	id.fit.staff.SIandMONavailable=which(ongoing_turnover$SI_COUNT_1yr.Scaled>0 & ongoing_turnover$MON_COUNT_1yr.Scaled>0)
+	#length(id.fit.staff.SIandMONavailable) # 4,010 sites have both SIs and MONitors
+
+	# NEW JUNE 9, 2014 - Create a Dummy Report Type Variable (should be the same for all sites) 
+	ongoing_turnover$REPORT_TYPE="PSQRV"
+	ongoing_turnover$Turn.prediction2=NA
+	ongoing_turnover$Turn.prediction2[id.fit.staff.SIandMONavailable]=predict(fit.staff.SIandMONavailable.FINAL,newdata=ongoing_turnover[id.fit.staff.SIandMONavailable,]) #Applying model coefficients from fit.staff1 model
+
+	#sum(is.na(ongoing_turnover$Turn.prediction2))
+
+	ongoing_turnover=ongoing_turnover[which(!is.na(ongoing_turnover$Turn.prediction2)),]
+	 
+	#dim(ongoing_turnover) # 4,010
+
+	ongoing_turnover$Turn.prediction2.P.active <- rank(ongoing_turnover$Turn.prediction2)/sum(!is.na(ongoing_turnover$Turn.prediction2))
+ 	#summary(ongoing_turnover$Turn.prediction2.P.active )
+
+	# Save for SH Scoring module
+	save(ongoing_turnover, file="RT_Model.Rdata", ascii=FALSE)
+	
+	# Add the PK column for RODBC/sqlSave function
+	ongoing_turnover$HM_WRK_RT_OUT_ID <- NA
+	
+	RT_OUT <- ongoing_turnover[,c("HM_WRK_RT_OUT_ID","HM_STUDY_ID","HM_SITE_ID","End_DT", "PERIOD_START_1yr","PAT_COUNT","SI_COUNT_1yr",
+	"SI_TURN_1yr","SI_TURN_1yr_p","MON_COUNT_1yr","MON_TURN_1yr","MON_TURN_1yr_p","Turn.prediction2", "Turn.prediction2.P.active")]
+
+	names(RT_OUT) <- c("HM_WRK_RT_OUT_ID","HM_STUDY_ID","HM_SITE_ID","RT_END_DATE","PERIOD_START_1YR","RT_PATIENT_COUNT","SI_COUNT_1YR",
+	"SI_TURNOVER_1YR","SI_TURNOVER_PERCENT","MONITOR_COUNT_1YR","MONITOR_TURNOVER_1YR","MONITOR_TURNOVER_PERCENT",
+	"PSQRV_ISSUE_COUNT_EXPECTED","RT_PERCENTILE")
+
+	#dim(RT_OUT) #4,010
+	
+	# Insert into WRK_RT_OUT using RODBCDataInsert function
+	source("/app/r/engine/RODBCDataInsert.R")
+	
+	logInfo("Saving RT Model results to WRK_RT_OUT...")	
+	insertRTOut(RT_OUT)
+	# write.csv(file="WRK_RT_OUT.csv", x=RT_OUT)
+	logInfo("Done saving RT Model results to WRK_RT_OUT...")
+	
+
+# write.csv(RT_OUT,file=paste(lib.outmodel,"RT_OUT.csv",sep=""))
+
+	# CREATE ROLE TURNOVER DATES DATA TO BE OUTPUT TO DATA MART
+
+	# subset active role dates data to in-scope sites
+	turnover_dates_use <- staff_turnover_dates[which(staff_turnover_dates$HM_SITE_ID %in%c(ongoing_turnover$HM_SITE_ID)) ,]
+
+	# Merge period start and end dates onto active role dates data and remove rows without period start dates	
+	TURNOVER_DATES_IN_PERIOD <- merge(turnover_dates_use, ongoing_turnover[,c("HM_SITE_ID","PERIOD_START_1yr","End_DT")], by="HM_SITE_ID", all.x=T)
+	TURNOVER_DATES_IN_PERIOD <- TURNOVER_DATES_IN_PERIOD[!is.na(TURNOVER_DATES_IN_PERIOD$PERIOD_START_1yr),]
+
+	# Remove roles where dates do not fall in analysis period for a site
+	TURNOVER_DATES_IN_PERIOD$START_DATE_DROPS <- ifelse((TURNOVER_DATES_IN_PERIOD$MISSING %in% c("START","NONE")) & (TURNOVER_DATES_IN_PERIOD$SITE_END < TURNOVER_DATES_IN_PERIOD$PERIOD_START_1yr),NA,"PASS")
+	TURNOVER_DATES_IN_PERIOD_2 <- TURNOVER_DATES_IN_PERIOD[!is.na(TURNOVER_DATES_IN_PERIOD$START_DATE_DROPS),]
+
+	TURNOVER_DATES_IN_PERIOD_2$END_DATE_DROPS <- ifelse((TURNOVER_DATES_IN_PERIOD_2$MISSING %in% c("END","NONE")) & (TURNOVER_DATES_IN_PERIOD_2$SITE_START > TURNOVER_DATES_IN_PERIOD_2$End_DT),NA,"PASS")
+	TURNOVER_DATES_IN_PERIOD_2 <- TURNOVER_DATES_IN_PERIOD_2[!is.na(TURNOVER_DATES_IN_PERIOD_2$END_DATE_DROPS),]
+
+	#dim(TURNOVER_DATES_IN_PERIOD_2) #32,898
+
+	# Create start and end dates for use in turnover box plot
+	TURNOVER_DATES_IN_PERIOD_2$SITE_START_CLEAN <- as.Date(TURNOVER_DATES_IN_PERIOD_2$PERIOD_START_1yr)
+	TURNOVER_DATES_IN_PERIOD_2$SITE_START_CLEAN <- as.Date(ifelse(TURNOVER_DATES_IN_PERIOD_2$MISSING %in% c("END","NONE") & TURNOVER_DATES_IN_PERIOD_2$SITE_START > TURNOVER_DATES_IN_PERIOD_2$PERIOD_START_1yr,
+								TURNOVER_DATES_IN_PERIOD_2$SITE_START,TURNOVER_DATES_IN_PERIOD_2$SITE_START_CLEAN), origin="1970-01-01")
+
+	TURNOVER_DATES_IN_PERIOD_2$SITE_END_CLEAN <- as.Date(TURNOVER_DATES_IN_PERIOD_2$End_DT)
+	TURNOVER_DATES_IN_PERIOD_2$SITE_END_CLEAN <- as.Date(ifelse(TURNOVER_DATES_IN_PERIOD_2$MISSING %in% c("START","NONE") & (TURNOVER_DATES_IN_PERIOD_2$SITE_END < TURNOVER_DATES_IN_PERIOD_2$End_DT),
+								TURNOVER_DATES_IN_PERIOD_2$SITE_END,TURNOVER_DATES_IN_PERIOD_2$SITE_END_CLEAN), origin="1970-01-01")
+
+	# Create indicator variable for roles for which turnover occurs during the during designated period
+	TURNOVER_DATES_IN_PERIOD_2$TURNOVER_INDICATOR <- ifelse(TURNOVER_DATES_IN_PERIOD_2$End_DT > TURNOVER_DATES_IN_PERIOD_2$SITE_END_CLEAN,1,0)
+
+	# Subset to relevant fields
+	TURNOVER_DATES_IN_PERIOD_FINAL_OUTPUT <- TURNOVER_DATES_IN_PERIOD_2[,c("HM_SITE_ID", "HM_PERSON_ID","ROLE","SITE_START_CLEAN","SITE_END_CLEAN", "TURNOVER_INDICATOR")]
+
+	#dim(TURNOVER_DATES_IN_PERIOD_FINAL_OUTPUT) # 32,898
+
+	
+	# Pivot (reshape) date fields with indicator of "start" and "end"
+	TURNOVER_DATES_IN_PERIOD_FINAL_OUTPUT_PIVOT <- TURNOVER_DATES_IN_PERIOD_FINAL_OUTPUT
+	names(TURNOVER_DATES_IN_PERIOD_FINAL_OUTPUT_PIVOT) <- c("HM_SITE_ID","HM_PERSON_ID","ROLE","START","END", "TURN_INDICATOR")
+	TURNOVER_DATES_IN_PERIOD_FINAL_OUTPUT_PIVOT <- reshape(TURNOVER_DATES_IN_PERIOD_FINAL_OUTPUT_PIVOT, varying=c("START","END"),v.names="DATES",timevar="DATE_TYPE", times=c("START","END"),direction="long")
+
+	#dim(TURNOVER_DATES_IN_PERIOD_FINAL_OUTPUT_PIVOT)# 65,796
+	
+	# Create Final Turnover Dates data
+	RT_OUT_HIST <- merge(TURNOVER_DATES_IN_PERIOD_FINAL_OUTPUT_PIVOT, V_W_RT_IN_CLINICAL_STUDY_SITE[,c("HM_STUDY_ID","HM_SITE_ID")], by="HM_SITE_ID",all.x=T)
+	RT_OUT_HIST$HM_WRK_RT_OUT_HIST_ID <- NA	
+	
+	# Subset to relevant fields and rename variables
+	RT_OUT_HIST <-RT_OUT_HIST[,c("HM_WRK_RT_OUT_HIST_ID","HM_STUDY_ID","HM_SITE_ID", "HM_PERSON_ID","ROLE","DATES","DATE_TYPE","TURN_INDICATOR")]
+	names(RT_OUT_HIST) <- c("HM_WRK_RT_OUT_HIST_ID","HM_STUDY_ID","HM_SITE_ID","HM_PERSON_ID","CONTACT_ROLE","TURNOVER_DATE","TURNOVER_DATE_TYPE","TURNOVER_INDICATOR")
+
+	# Insert into WRK_RT_OUT_HIST using RODBCDataInsert function
+	logInfo("Saving RT Model results to WRK_RT_OUT_HIST...")	
+	insertRTOutHist(RT_OUT_HIST)
+	# write.csv(file="WRK_RT_OUT_HIST.csv", x=RT_OUT_HIST)
+	logInfo("Completed saving RT Model results to WRK_RT_OUT_HIST...")
+	logInfo("<DONE> - Exiting RT module...")
+	
+	# write.csv(RT_OUT_HIST,file=paste(lib.outmodel,"RT_OUT_HIST.csv",sep=""))
