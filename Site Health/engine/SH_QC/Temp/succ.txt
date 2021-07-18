@@ -1,3 +1,0 @@
-Dear Recipient:
-
-R call completed with errors and warnings, please find attached R log file
